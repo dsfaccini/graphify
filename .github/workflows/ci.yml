@@ -7,6 +7,9 @@ on:
     branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   skillgen-check:
     # Fast lint-style guard: the skill files under graphify/ are generated from
@@ -16,7 +19,7 @@ jobs:
     # enum, the monolith round-trips, and the always-on round-trips.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # The audit-coverage, monolith-roundtrip, and always-on-roundtrip
           # validators read blobs from origin/v8. A shallow checkout omits that
@@ -25,7 +28,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.12"
 
@@ -53,7 +56,7 @@ jobs:
         python-version: ["3.10", "3.12"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # test_skillgen.py reads pre-split skill bodies from the immutable
           # baseline commit via `git show`; a shallow checkout omits that history
@@ -61,7 +64,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -79,18 +82,13 @@ jobs:
           uv run --frozen graphify install
 
   security-scan:
-    # The dev deps include bandit and pip-audit. Run them in CI so a new
-    # HIGH-severity finding or vulnerable dependency is caught on the PR that
-    # introduces it, rather than at the next manual audit.
-    # Non-blocking for now (continue-on-error) to avoid breaking CI on
-    # pre-existing findings; remove continue-on-error after the initial
-    # cleanup pass.
+    # Bandit remains advisory until its existing findings are remediated.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.12"
 
@@ -101,6 +99,8 @@ jobs:
         continue-on-error: true
         run: uv run --frozen bandit -r graphify -ll
 
-      - name: pip-audit (dependency vulnerabilities)
-        continue-on-error: true
-        run: uv run --frozen pip-audit --strict
+      - name: pip-audit (all locked dependencies)
+        run: |
+          ulimit -v 8388608
+          uv export --all-extras --no-emit-project --frozen --format requirements.txt |
+            uv run --frozen pip-audit --strict --require-hashes --disable-pip --requirement /dev/stdin
