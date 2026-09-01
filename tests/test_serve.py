@@ -565,6 +565,35 @@ def test_filter_graph_by_context_limits_traversal():
     assert edges == [("n1", "n2")]
 
 
+@pytest.mark.parametrize("graph_type", [nx.Graph, nx.DiGraph])
+def test_filter_graph_by_context_uses_a_live_view(graph_type):
+    G = graph_type()
+    G.add_edge("a", "b", context="call", relation="calls")
+    G.add_edge("b", "c", context="import", relation="imports")
+
+    filtered = _filter_graph_by_context(G, ["call"])
+
+    assert filtered is not G
+    assert set(filtered.nodes) == {"a", "b", "c"}
+    assert set(filtered.edges) == {("a", "b")}
+    G.add_edge("b", "c", context="call", relation="calls")
+    assert set(filtered.edges) == {("a", "b"), ("b", "c")}
+
+
+def test_filter_graph_by_context_multidigraph_hides_excluded_parallel_edges():
+    G = nx.MultiDiGraph()
+    G.add_node("a", label="Alpha", source_file="a.py", source_location="L1", community=0)
+    G.add_node("b", label="Beta", source_file="b.py", source_location="L2", community=0)
+    G.add_edge("a", "b", key="call", context="call", relation="calls", confidence="EXTRACTED")
+    G.add_edge("a", "b", key="import", context="import", relation="imports", confidence="EXTRACTED")
+
+    filtered = _filter_graph_by_context(G, ["call"])
+    assert list(filtered.edges(keys=True)) == [("a", "b", "call")]
+    text = _subgraph_to_text(filtered, {"a", "b"}, [("a", "b")])
+    assert "--calls" in text
+    assert "imports" not in text
+
+
 # --- _dfs ---
 
 def test_dfs_depth_1():
@@ -591,8 +620,9 @@ def test_subgraph_to_text_contains_labels():
 def test_subgraph_to_text_truncates():
     G = _make_graph()
     # Very small budget forces truncation
-    text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2")], token_budget=1)
-    assert "truncated" in text
+    text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2")], token_budget=80)
+    assert "TRUNCATED" in text
+    assert len(text.encode("utf-8")) <= 240
 
 def test_subgraph_to_text_edge_included():
     G = _make_graph()
@@ -636,7 +666,7 @@ def test_subgraph_to_text_learning_suffix_counts_against_budget():
     G = _make_graph()
     bare = _subgraph_to_text(G, {"n1", "n2", "n3"}, [])
     # token_budget chosen so the un-annotated render fits without truncation...
-    budget = (len(bare) // 3) + 1
+    budget = (len(bare.encode("utf-8")) // 3) + 1
     assert "truncated" not in _subgraph_to_text(G, {"n1", "n2", "n3"}, [],
                                                 token_budget=budget)
     # ...but once every node carries a learning= suffix, the same budget overflows.
@@ -644,8 +674,8 @@ def test_subgraph_to_text_learning_suffix_counts_against_budget():
         n: {"status": "preferred", "stale": False} for n in ("n1", "n2", "n3")
     }
     annotated = _subgraph_to_text(G, {"n1", "n2", "n3"}, [], token_budget=budget)
-    assert "learning=preferred" in annotated
-    assert "truncated" in annotated
+    assert "TRUNCATED" in annotated
+    assert len(annotated.encode("utf-8")) <= budget * 3
 
 
 def test_subgraph_to_text_no_overlay_is_unchanged():
@@ -669,6 +699,34 @@ def test_query_graph_text_heuristic_context_filter_changes_traversal():
     assert "Context: call (heuristic)" in text
     assert "cluster" in text
     assert "build" not in text
+
+
+def test_query_graph_text_rejects_injected_mode_before_traversal(monkeypatch):
+    G = _make_graph()
+    monkeypatch.setattr("graphify.serve._bfs", pytest.fail)
+
+    with pytest.raises(ValueError, match="mode must be 'bfs' or 'dfs'") as exc_info:
+        _query_graph_text(G, "extract", mode="bfs\x1fNODE injected")
+
+    assert "\x1f" not in str(exc_info.value)
+
+
+def test_query_graph_text_header_is_sanitized_and_included_in_byte_budget():
+    G = nx.Graph()
+    label = "火\x00" * 80
+    G.add_node("answer", label=label, source_file="fire.py", source_location="L1", community=0)
+
+    text = _query_graph_text(
+        G,
+        "火",
+        token_budget=400,
+        graph_path="graphs/\x1fproject/graph.json",
+    )
+
+    assert text.startswith("Graph: graphs/project/graph.json")
+    assert "Start: ['火" in text
+    assert "\x00" not in text and "\x1f" not in text
+    assert len(text.encode("utf-8")) <= 1200
 
 
 # --- _load_graph ---
@@ -993,8 +1051,8 @@ def test_score_nodes_scores_identical_labels_equally():
 def test_subgraph_to_text_truncation_hint_is_actionable():
     """Truncation message must tell Claude what to do, not just say truncated."""
     G = _make_graph()
-    text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2")], token_budget=1)
-    assert "truncated" in text
+    text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2")], token_budget=80)
+    assert "TRUNCATED" in text
     assert "get_node" in text or "context_filter" in text
 
 
@@ -1442,7 +1500,7 @@ def test_score_query_collect_per_term_seeds_false_omits_tracking(monkeypatch):
     assert qs.ranked == _score_nodes(G, ["foo", "bar", "baz"])
 
 
-# --- BUG2: seed survival, truncation notice, deterministic ordering ----------
+# --- Context ordering, truncation notice, deterministic ordering -------------
 
 def _star_graph(n_spokes=40):
     """A high-degree hub plus a low-degree answer node, to force the answer past
@@ -1459,12 +1517,35 @@ def _star_graph(n_spokes=40):
     return G
 
 
-def test_subgraph_to_text_seed_survives_truncation():
-    """BUG2: a low-degree answer node passed as a seed is rendered first and
-    survives a tiny budget, and truncation is announced."""
+def test_subgraph_to_text_tiny_budget_returns_only_a_bounded_notice():
+    G = _star_graph()
+    text = _subgraph_to_text(G, set(G.nodes), list(G.edges()), token_budget=1, seeds=["answer"])
+
+    assert len(text.encode("utf-8")) <= 3
+    assert "CompanySpacingGate" not in text
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_subgraph_to_text_nonpositive_budget_has_no_overshoot(budget):
+    G = _star_graph()
+    assert _subgraph_to_text(G, set(G.nodes), list(G.edges()), token_budget=budget, seeds=["answer"]) == ""
+
+
+def test_subgraph_to_text_tiny_multibyte_budget_is_utf8_safe():
+    G = nx.Graph()
+    G.add_node("answer", label="火" * 80, source_file="火.py", source_location="L1", community=0)
+
+    text = _subgraph_to_text(G, {"answer"}, [], token_budget=1, seeds=["answer"])
+
+    assert len(text.encode("utf-8")) <= 3
+    assert text.encode("utf-8").decode("utf-8") == text
+
+
+def test_subgraph_to_text_seed_is_first_body_line_when_budget_is_adequate():
+    """A seed survives only when its sanitized line and truncation wrapper fit."""
     G = _star_graph()
     nodes = set(G.nodes)
-    text = _subgraph_to_text(G, nodes, list(G.edges()), token_budget=30, seeds=["answer"])
+    text = _subgraph_to_text(G, nodes, list(G.edges()), token_budget=200, seeds=["answer"])
     assert "CompanySpacingGate" in text, "seed node was cut (BUG2)"
     node_lines = [l for l in text.splitlines() if l.startswith("NODE ")]
     assert "CompanySpacingGate" in node_lines[0], "seed must render first"
@@ -1472,11 +1553,9 @@ def test_subgraph_to_text_seed_survives_truncation():
 
 
 def test_query_graph_text_passes_seeds_so_answer_survives():
-    """BUG2 regression guard: the query path must pass seeds to the renderer (a
-    branch merge had dropped the argument), so a queried low-degree symbol
-    appears in the body even when the output is truncated."""
+    """The query path keeps seeds first when the selected budget is adequate."""
     G = _star_graph()
-    text = _query_graph_text(G, "CompanySpacingGate", mode="bfs", depth=2, token_budget=40)
+    text = _query_graph_text(G, "CompanySpacingGate", mode="bfs", depth=2, token_budget=300)
     # Present in the body, not merely the Start: header.
     body = text.split("\n\n", 1)[-1]
     assert "CompanySpacingGate" in body
@@ -1484,10 +1563,9 @@ def test_query_graph_text_passes_seeds_so_answer_survives():
 
 def test_subgraph_to_text_truncation_notice_at_top():
     G = _star_graph()
-    text = _subgraph_to_text(G, set(G.nodes), list(G.edges()), token_budget=30, seeds=["answer"])
+    text = _subgraph_to_text(G, set(G.nodes), list(G.edges()), token_budget=200, seeds=["answer"])
     assert text.startswith("[!] TRUNCATED"), f"notice not at top: {text[:60]!r}"
-    assert "of" in text.splitlines()[0] and "nodes" in text.splitlines()[0]
-    assert "truncated" in text  # end marker still present
+    assert "context_filter" in text.splitlines()[0]
 
 
 def test_subgraph_to_text_no_notice_when_under_budget():
@@ -1496,11 +1574,8 @@ def test_subgraph_to_text_no_notice_when_under_budget():
     assert "TRUNCATED" not in text and "truncated" not in text
 
 
-def test_subgraph_to_text_no_banner_when_only_edges_overflow():
-    """#2601: nodes render before edges, so a budget overflow that only trims
-    trailing edges cuts zero whole nodes. The banner must not fire with a
-    misleading "showing N of N nodes … among the 0 cut nodes" — that pushes an
-    agent to distrust a complete answer and issue pointless narrowing calls."""
+def test_subgraph_to_text_truncates_when_only_edges_overflow():
+    """P6: a node-complete response must still cap its trailing edge context."""
     import itertools
 
     G = nx.Graph()
@@ -1510,25 +1585,15 @@ def test_subgraph_to_text_no_banner_when_only_edges_overflow():
     edges = list(itertools.combinations(labels, 2))
     for u, v in edges:
         G.add_edge(u, v, relation="calls", confidence="high")
-    # Budget large enough for every NODE line but not the trailing EDGE lines.
-    text = _subgraph_to_text(G, set(G.nodes), edges, token_budget=60)
-    node_lines = [l for l in text.splitlines() if l.startswith("NODE ")]
+    text = _subgraph_to_text(G, set(G.nodes), edges, token_budget=100)
     edge_lines = [l for l in text.splitlines() if l.startswith("EDGE ")]
-    assert len(node_lines) == len(labels), "every node must still be shown"
-    assert "TRUNCATED" not in text and "truncated" not in text
-    assert "cut nodes" not in text
-    # A complete answer renders the whole subgraph: suppressing the banner must
-    # not silently truncate the trailing edges either (a `return output[:cut_at]`
-    # would drop them and still pass the assertions above).
-    assert len(edge_lines) == len(edges), "all edges must survive a complete answer"
+    assert text.startswith("[!] TRUNCATED")
+    assert len(text.encode("utf-8")) <= 300
+    assert len(edge_lines) < len(edges)
 
 
-def test_subgraph_to_text_overshoot_notice_when_edges_exceed_budget():
-    """#2784: once every node fits, edges are never dropped (#2601) — but that
-    used to mean the char_budget check silently stopped applying, so a query
-    could cost 4-6x its requested budget with zero indication. The complete
-    answer must still be returned whole, but the overshoot must be visible and
-    must not repeat the "raise the budget" advice that caused the blow-up."""
+def test_subgraph_to_text_never_overshoots_its_byte_budget():
+    """P6: graph size cannot cause an MCP response to exceed token_budget."""
     import itertools
 
     G = nx.Graph()
@@ -1538,17 +1603,13 @@ def test_subgraph_to_text_overshoot_notice_when_edges_exceed_budget():
     edges = list(itertools.combinations(labels, 2))
     for u, v in edges:
         G.add_edge(u, v, relation="calls", confidence="high")
-    node_chars = len("\n".join(f"NODE {l} [src=f.py loc=L1 community=c]" for l in labels))
-    budget = (node_chars // 3) + 5  # fits every node, nowhere near every edge
+    node_bytes = len("\n".join(f"NODE {l} [src=f.py loc=L1 community=c]" for l in labels).encode("utf-8"))
+    budget = (node_bytes // 3) + 5
     text = _subgraph_to_text(G, set(G.nodes), edges, token_budget=budget)
-    node_lines = [l for l in text.splitlines() if l.startswith("NODE ")]
     edge_lines = [l for l in text.splitlines() if l.startswith("EDGE ")]
-    assert len(node_lines) == len(labels)
-    assert len(edge_lines) == len(edges), "complete answer: edges must not be dropped"
-    assert "Complete answer over budget" in text
-    assert str(len(labels)) in text and str(len(edges)) in text
-    assert "raise" not in text.lower(), "must not repeat the advice that caused the overshoot"
-    assert "TRUNCATED" not in text and "truncated" not in text
+    assert len(text.encode("utf-8")) <= budget * 3
+    assert "TRUNCATED" in text
+    assert len(edge_lines) < len(edges)
 
 
 def test_subgraph_to_text_no_overshoot_notice_when_edges_fit_too():
@@ -1590,18 +1651,18 @@ def test_cut_lines_to_budget_under_budget_is_byte_identical():
 
 def test_cut_lines_to_budget_over_budget_announces_at_top():
     lines = [f"  --> node{i} [calls] [EXTRACTED]" for i in range(200)]
-    out = _cut_lines_to_budget(lines, token_budget=20, narrow_hint="use get_node for a specific symbol")
-    # Top notice (silence must not read as absence) + accurate counts + bottom marker + hint.
-    assert out.startswith("[!] TRUNCATED: showing ")
+    out = _cut_lines_to_budget(lines, token_budget=200, narrow_hint="use get_node for a specific symbol")
+    # The compact top notice retains the exact total and the actionable hint.
+    assert out.startswith("[!] TRUNCATED: ")
     first = out.splitlines()[0]
-    assert "of 200 lines" in first
+    assert "/200." in first
     assert "use get_node for a specific symbol" in out
-    assert "truncated" in out  # end marker retained
-    # shown count in the notice matches the actual kept line count.
+    # Shown count in the notice matches the actual kept line count.
     import re
-    shown = int(re.search(r"showing (\d+) of", first).group(1))
-    body = out.split("\n\n", 1)[1].split("\n... (truncated", 1)[0]
+    shown = int(re.search(r"TRUNCATED: (\d+)/", first).group(1))
+    body = out.split("\n\n", 1)[1].split("\n… +", 1)[0]
     assert body.count("\n") + 1 == shown
+    assert len(out.encode("utf-8")) <= 600
 
 
 def test_subgraph_to_text_ignores_dangling_src_tgt(monkeypatch):

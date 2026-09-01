@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from array import array
+from collections.abc import Iterable
 from collections import OrderedDict
 from pathlib import Path
 import threading
@@ -866,20 +867,24 @@ def _resolve_context_filters(question: str, explicit_filters: list[str] | None =
 
 
 def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> nx.Graph:
-    filters = set(_normalize_context_filters(context_filters))
+    filters = frozenset(_normalize_context_filters(context_filters))
     if not filters:
         return G
-    H = G.__class__()
-    H.add_nodes_from(G.nodes(data=True))
+
+    # A filtered query used to allocate a second graph containing every node and
+    # every retained edge. A subgraph view keeps the shared graph immutable and
+    # applies the same context predicate at adjacency access time. In particular,
+    # keep the multigraph key in the predicate: filtering only by (u, v) would
+    # let an excluded parallel edge leak back into the rendered response.
     if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
-        for u, v, key, data in G.edges(keys=True, data=True):
-            if data.get("context") in filters:
-                H.add_edge(u, v, key=key, **data)
-    else:
-        for u, v, data in G.edges(data=True):
-            if data.get("context") in filters:
-                H.add_edge(u, v, **data)
-    return H
+        return nx.subgraph_view(
+            G,
+            filter_edge=lambda u, v, key: G[u][v][key].get("context") in filters,
+        )
+    return nx.subgraph_view(
+        G,
+        filter_edge=lambda u, v: G[u][v].get("context") in filters,
+    )
 
 
 def _complete_induced_edges(G: nx.Graph, visited: set[str], edges_seen: list[tuple]) -> None:
@@ -990,22 +995,102 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
-    """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
+def _utf8_prefix(text: str, byte_limit: int) -> str:
+    """Return a UTF-8-safe prefix whose encoded form is at most ``byte_limit``."""
+    if byte_limit <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= byte_limit:
+        return text
+    return encoded[:byte_limit].decode("utf-8", errors="ignore")
 
-    seeds: exact-match nodes rendered first before the degree-sorted expansion,
-    so the queried symbol always appears at the top of the output.
+
+class _ContextLineWriter:
+    """Keep an MCP text response within its existing ~3-bytes/token contract.
+
+    The writer stores only lines which still fit. It nevertheless consumes the
+    complete line iterator so a truncation notice can report an exact count,
+    without materialising the omitted graph context.
     """
-    char_budget = token_budget * 3
-    lines = []
+
+    def __init__(self, token_budget: int):
+        self._byte_limit = max(0, token_budget) * 3
+        self._lines: list[str] = []
+        self._bytes = 0
+        self._total_lines = 0
+        self._truncated = False
+
+    def add(self, line: str) -> None:
+        self._total_lines += 1
+        if self._truncated:
+            return
+        line_bytes = len(line.encode("utf-8"))
+        separator_bytes = 1 if self._lines else 0
+        if self._bytes + separator_bytes + line_bytes <= self._byte_limit:
+            self._lines.append(line)
+            self._bytes += separator_bytes + line_bytes
+        else:
+            self._truncated = True
+
+    def finish(self, narrow_hint: str) -> str:
+        if self._total_lines == len(self._lines):
+            return "\n".join(self._lines)
+
+        # The wrapper is part of the caller's budget. Retain a short count at
+        # the end; the actionable hint appears once at the top when it fits.
+        while self._lines:
+            shown = len(self._lines)
+            cut_count = self._total_lines - shown
+            notice = f"[!] TRUNCATED: {shown}/{self._total_lines}. {narrow_hint}"
+            tail = f"\n… +{cut_count}"
+            output = notice + "\n\n" + "\n".join(self._lines) + tail
+            if len(output.encode("utf-8")) <= self._byte_limit:
+                return output
+            removed = self._lines.pop()
+            self._bytes -= len(removed.encode("utf-8")) + (1 if self._lines else 0)
+
+        notice = f"[!] TRUNCATED. {narrow_hint}"
+        return _utf8_prefix(notice, self._byte_limit)
+
+
+def _cut_lines_to_budget(lines: Iterable[str], token_budget: int, narrow_hint: str) -> str:
+    """Render line-oriented MCP context under a UTF-8 byte budget.
+
+    ``token_budget`` remains the public approximate-token contract; three UTF-8
+    bytes per requested token is the existing conversion. Unlike the previous
+    implementation, omitted lines are never assembled into a temporary output.
+    """
+    writer = _ContextLineWriter(token_budget)
+    for line in lines:
+        writer.add(line)
+    return writer.finish(narrow_hint)
+
+
+def _subgraph_to_text(
+    G: nx.Graph,
+    nodes: set[str],
+    edges: list[tuple],
+    token_budget: int = 2000,
+    *,
+    seeds: list[str] | None = None,
+    prefix_lines: Iterable[str] = (),
+) -> str:
+    """Render subgraph as byte-bounded MCP text.
+
+    Seed lines render first among body lines. They survive a truncation when a
+    complete sanitized seed line, preceding headers, and the required notice
+    all fit in the caller-selected byte budget.
+    """
+    writer = _ContextLineWriter(token_budget)
+    for line in prefix_lines:
+        writer.add(line)
     # Work-memory overlay (derived sidecar) stashed on the graph at load time.
     # Empty when no sidecar exists, so un-annotated output stays byte-identical.
     overlay = getattr(G, "graph", {}).get("_learning_overlay", {}) or {}
     seed_set = set(seeds or [])
     seed_hits = [n for n in (seeds or []) if n in nodes]
-    # Rank non-seed nodes by hop distance from the seeds so the node that answers
-    # the query (a direct hit or its close neighbors) survives the budget cut
-    # instead of being pushed past it by incidental high-degree hubs (#BUG2). BFS
+    # Rank non-seed nodes by hop distance from the seeds so the direct answer
+    # precedes incidental high-degree hubs. BFS
     # discovery order was discarded upstream (_bfs returns a set), so recompute
     # layers here over BOTH edge directions. Deterministic: neighbor iteration is
     # insertion-ordered and the sort key ends in str(n) (no hash-order).
@@ -1052,7 +1137,7 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
             f"community={sanitize_label(str(d.get('community_name') or d.get('community', '')))}"
             f"{learning_suffix}]"
         )
-        lines.append(line)
+        writer.add(line)
     for u, v in edges:
         if u in nodes and v in nodes:
             raw = G[u][v]
@@ -1087,90 +1172,9 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
                 f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
                 f"{sanitize_label(G.nodes[tgt].get('label', tgt))}{at_suffix}"
             )
-            lines.append(line)
-    output = "\n".join(lines)
-    if len(output) > char_budget:
-        cut_at = output[:char_budget].rfind("\n")
-        cut_at = cut_at if cut_at > 0 else char_budget
-        # Never cut the seed nodes: they render first, so if the budget lands
-        # inside the seed block, extend the cut to cover it. The symbol the
-        # question named must always be in the answer (#BUG2). Seeds are bounded
-        # (_pick_seeds max_k + one per term), so the overshoot is a few lines.
-        if seed_hits:
-            seed_block_end = sum(len(lines[i]) + 1 for i in range(len(seed_hits))) - 1
-            cut_at = max(cut_at, min(seed_block_end, len(output)))
-        total_nodes = sum(1 for l in lines if l.startswith("NODE "))
-        shown_nodes = output[:cut_at].count("\nNODE ") + (1 if output.startswith("NODE ") else 0)
-        cut_count = total_nodes - shown_nodes
-        # Nodes render before edges, so a char-budget overflow whose cut lands
-        # past the last NODE line drops only trailing edges — no whole node is
-        # lost. Announcing "showing N of N nodes … among the 0 cut nodes" then
-        # reads as a false truncation warning that teaches an agent to distrust a
-        # complete answer and burn follow-up narrowing calls for nodes that were
-        # never cut (#2601). When every node is shown the answer is complete, so
-        # edges are never dropped either (returning output[:cut_at] here would
-        # silently truncate them) — but that completeness guarantee is exactly
-        # why a query can quietly cost 4-6x its requested budget once the last
-        # node crosses the fit line (#2784): the check above only ever compared
-        # the FULL output (nodes+edges) against char_budget, so this branch was
-        # already known to be over budget, yet said nothing about it. Report the
-        # real size instead of silence — still the complete, non-truncated
-        # answer, just an honest one.
-        if cut_count == 0:
-            # Reached only inside `len(output) > char_budget`, so every node
-            # fits but the full nodes+edges output does not: an honest
-            # over-budget notice, never a truncation.
-            total_edges = sum(1 for l in lines if l.startswith("EDGE "))
-            est_tokens = len(output) // 3
-            return (
-                f"[i] Complete answer over budget: all {total_nodes} nodes and "
-                f"{total_edges} edges shown (~{est_tokens} tokens vs the "
-                f"requested ~{token_budget}-token budget). Edges are never "
-                f"dropped once every node fits, so this is already the full "
-                f"answer — raising --budget further will not shrink it. Narrow "
-                f"with context_filter=['call'] or use get_node for a specific "
-                f"symbol to reduce size instead.\n\n"
-            ) + output
-        # Prominent notice at the TOP so a truncated answer can never be mistaken
-        # for a complete one — silence used to read as absence (#BUG2). The
-        # notice + end marker sit OUTSIDE char_budget by design (two bounded
-        # wrapper lines, like the existing end marker).
-        output = (
-            f"[!] TRUNCATED: showing {shown_nodes} of {total_nodes} nodes "
-            f"(~{token_budget}-token budget). The answer may be among the "
-            f"{cut_count} cut nodes — raise the token budget (CLI: --budget) or "
-            f"narrow the query (e.g. context_filter=['call'], or get_node for a "
-            f"specific symbol).\n\n"
-            + output[:cut_at]
-            + f"\n... (truncated — {cut_count} more nodes cut by ~{token_budget}-token budget."
-            f" Narrow with context_filter=['call'] or use get_node for a specific symbol)"
-        )
-    return output
-
-
-def _cut_lines_to_budget(lines: list[str], token_budget: int, narrow_hint: str) -> str:
-    """Render pre-built lines under the same ~3-chars/token budget rule as
-    _subgraph_to_text; over-budget output is cut at a line boundary with a count and a
-    narrowing hint instead of flooding the caller's context window."""
-    output = "\n".join(lines)
-    char_budget = token_budget * 3
-    if len(output) <= char_budget:
-        return output
-    cut_at = output[:char_budget].rfind("\n")
-    cut_at = cut_at if cut_at > 0 else char_budget
-    kept = output[:cut_at]
-    shown = kept.count("\n") + 1
-    cut_count = len(lines) - shown
-    # Announce truncation at the TOP as well, matching _subgraph_to_text — a
-    # bottom-only marker reads as silence/absence (the BUG-2 fix rationale). The
-    # notice sits outside char_budget by design (one bounded wrapper line).
-    return (
-        f"[!] TRUNCATED: showing {shown} of {len(lines)} lines "
-        f"(~{token_budget}-token budget). {narrow_hint}\n\n"
-        + kept
-        + f"\n... (truncated — {cut_count} more lines cut by ~{token_budget}-token budget. "
-        + narrow_hint
-        + ")"
+            writer.add(line)
+    return writer.finish(
+        "Narrow with context_filter=['call'] or use get_node for a specific symbol"
     )
 
 
@@ -1205,6 +1209,8 @@ def _query_graph_text(
     context_filters: list[str] | None = None,
     graph_path: str | None = None,
 ) -> str:
+    if not isinstance(mode, str) or mode not in {"bfs", "dfs"}:
+        raise ValueError("mode must be 'bfs' or 'dfs'")
     terms = _query_terms(question)
     # One graph scoring pass produces both the combined ranking (used to drive
     # the gap-based seed selection below) and the per-token singleton winners
@@ -1234,7 +1240,7 @@ def _query_graph_text(
     nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
-        f"Start: {[G.nodes[n].get('label', n) for n in start_nodes]}",
+        f"Start: {[sanitize_label(G.nodes[n].get('label', n)) for n in start_nodes]}",
     ]
     # Name the graph this answer came from. `graphify-out/` resolves against the
     # CWD, so running a query from a parent project while thinking about a
@@ -1245,16 +1251,23 @@ def _query_graph_text(
     # noticing. The node count travels with it because "355 nodes" vs "3178
     # nodes" is often the first thing that looks wrong.
     if graph_path:
-        header_parts.insert(0, f"Graph: {_display_graph_path(graph_path)} "
+        header_parts.insert(0, f"Graph: {sanitize_label(_display_graph_path(graph_path))} "
                                f"({G.number_of_nodes()} nodes)")
     if resolved_filters:
-        header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
+        header_parts.append(
+            f"Context: {', '.join(sanitize_label(value) for value in resolved_filters)} "
+            f"({filter_source})"
+        )
     header_parts.append(f"{len(nodes)} nodes found")
-    header = " | ".join(header_parts) + "\n\n"
-    # Pass the seeds so the queried symbol renders first and survives truncation
-    # (#BUG2): a branch merge had silently dropped this argument, leaving the
-    # seed-first ordering as dead code.
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
+    # Pass seeds so their complete sanitized lines precede other body lines.
+    return _subgraph_to_text(
+        traversal_graph,
+        nodes,
+        edges,
+        token_budget,
+        seeds=start_nodes,
+        prefix_lines=(" | ".join(header_parts), ""),
+    )
 
 
 def _find_node_tiers(
@@ -1621,7 +1634,9 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
                     "type": "object",
                     "properties": {
                         "question": {"type": "string", "description": "Natural language question or keyword search"},
-                        "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs",
+                        # Validate in the handler so invalid values cannot be echoed
+                        # unsanitized by the MCP SDK's schema-error formatter.
+                        "mode": {"type": "string", "default": "bfs",
                                  "description": "bfs=broad context, dfs=trace a specific path"},
                         "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
                         "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
@@ -1767,6 +1782,8 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
         from graphify import querylog
         question = arguments["question"]
         mode = arguments.get("mode", "bfs")
+        if not isinstance(mode, str) or mode not in {"bfs", "dfs"}:
+            raise ToolError("mode must be 'bfs' or 'dfs'")
         depth = min(int(arguments.get("depth", 3)), 6)
         budget = int(arguments.get("token_budget", 2000))
         context_filter = arguments.get("context_filter")
@@ -1820,7 +1837,7 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
         nid, err = _resolve_single_node(G, label)
         if err:
             return err
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+
         def _edge_at(d: dict) -> str:
             # Edge location = the relation SITE (call/import line) in the source
             # node's file, not a def line (#BUG1).
@@ -1829,27 +1846,31 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
                 f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
                 if loc else ""
             )
-        for nb in G.successors(nid):
-            d = edge_data(G, nid, nb)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
-        for nb in G.predecessors(nid):
-            d = edge_data(G, nb, nid)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
+
+        def _lines() -> Iterable[str]:
+            yield f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"
+            for nb in G.successors(nid):
+                d = edge_data(G, nid, nb)
+                rel = d.get("relation", "")
+                if rel_filter and rel_filter not in rel.lower():
+                    continue
+                yield (
+                    f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                    f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+                )
+            for nb in G.predecessors(nid):
+                d = edge_data(G, nb, nid)
+                rel = d.get("relation", "")
+                if rel_filter and rel_filter not in rel.lower():
+                    continue
+                yield (
+                    f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                    f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+                )
+
         budget = int(arguments.get("token_budget", 2000))
         return _cut_lines_to_budget(
-            lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
+            _lines(), budget, "Narrow with relation_filter or use get_node for a specific symbol"
         )
 
     def _tool_get_community(arguments: dict) -> str:
@@ -1858,17 +1879,20 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
         if not nodes:
             return f"Community {cid} not found."
         header = _community_header(cid, G.nodes[nodes[0]].get("community_name"))
-        lines = [f"{header} ({len(nodes)} nodes):"]
-        for n in nodes:
-            d = G.nodes[n]
-            # Sanitise label and source_file (F-010).
-            lines.append(
-                f"  {sanitize_label(d.get('label', n))} "
-                f"[{sanitize_label(str(d.get('source_file', '')))}]"
-            )
+
+        def _lines() -> Iterable[str]:
+            yield f"{header} ({len(nodes)} nodes):"
+            for n in nodes:
+                d = G.nodes[n]
+                # Sanitise label and source_file (F-010).
+                yield (
+                    f"  {sanitize_label(d.get('label', n))} "
+                    f"[{sanitize_label(str(d.get('source_file', '')))}]"
+                )
+
         budget = int(arguments.get("token_budget", 2000))
         return _cut_lines_to_budget(
-            lines, budget, "Raise token_budget or use get_node for specific members"
+            _lines(), budget, "Raise token_budget or use get_node for specific members"
         )
 
     def _tool_god_nodes(arguments: dict) -> str:

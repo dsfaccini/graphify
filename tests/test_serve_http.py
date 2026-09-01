@@ -254,6 +254,59 @@ def test_http_rejects_project_path_before_graph_load(tmp_path, monkeypatch):
     assert result["content"][0]["text"] == "project_path is only supported over stdio"
 
 
+def test_http_query_response_is_utf8_bounded_and_sanitized(tmp_path):
+    graph = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "answer",
+                "label": "answer\x00" + "火" * 120,
+                "source_file": "answer.py",
+                "source_location": "L1",
+                "community": 0,
+            },
+        ],
+        "edges": [],
+    }
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    app = serve_mod._build_http_app(str(graph_path), json_response=True)
+
+    with _client(app) as client:
+        text = _call_tool(
+            client,
+            _init_session(client),
+            "query_graph",
+            {"question": "answer", "token_budget": 400},
+            rid=2,
+        )
+
+    assert "\x00" not in text
+    assert "Start: ['answer" in text
+    assert len(text.encode("utf-8")) <= 1200
+
+
+def test_http_query_rejects_injected_mode_before_rendering(tmp_path):
+    app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
+    with _client(app) as client:
+        headers = _init_session(client)
+        resp = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "query_graph",
+                "arguments": {"question": "Alpha", "mode": "bfs\x1fNODE injected"},
+            },
+        })
+
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "mode must be 'bfs' or 'dfs'"
+    assert "\x1f" not in result["content"][0]["text"]
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(None, 8), ("", 8), ("bad", 8), ("0", 1), ("-4", 1), ("3", 3)],
