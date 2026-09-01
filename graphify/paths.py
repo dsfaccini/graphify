@@ -21,9 +21,13 @@ import os
 import re
 import stat
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TextIO
 
 GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
+_ATOMIC_REPLACE_ATTEMPTS = 3
 
 
 def _atomic_replace(path: "str | Path", write_fn) -> None:
@@ -63,15 +67,18 @@ def _atomic_replace(path: "str | Path", write_fn) -> None:
             os.chmod(tmp, mode)
         except OSError:
             pass
-        try:
-            os.replace(tmp, str(real))
-        except PermissionError:
-            # Windows: os.replace fails (WinError 5/32) when the destination is
-            # briefly locked by another handle (antivirus, an open reader). Fall
-            # back to copy-then-delete, matching graphify.cache's atomic writer.
-            import shutil
-            shutil.copy2(tmp, str(real))
-            os.unlink(tmp)
+        for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp, str(real))
+                break
+            except PermissionError:
+                if attempt == _ATOMIC_REPLACE_ATTEMPTS - 1:
+                    raise
+                # Windows can briefly lock a destination through an antivirus
+                # scanner or open reader. Retry the atomic operation; never
+                # copy over the live file because that would expose a partial
+                # destination if the copy failed.
+                time.sleep(0.01 * (attempt + 1))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -91,6 +98,16 @@ def _atomic_replace(path: "str | Path", write_fn) -> None:
 def write_text_atomic(path: "str | Path", text: str) -> None:
     """Atomically write ``text`` (UTF-8) to ``path``. See :func:`_atomic_replace`."""
     _atomic_replace(path, lambda f: f.write(text))
+
+
+def write_callback_atomic(path: "str | Path", write: "Callable[[TextIO], None]") -> None:
+    """Atomically write content produced by ``write``.
+
+    This is the streaming counterpart to :func:`write_text_atomic`: the
+    callback owns incremental emission while :func:`_atomic_replace` retains
+    the same temporary-file, symlink, mode, cleanup, and replace semantics.
+    """
+    _atomic_replace(path, write)
 
 
 def write_json_atomic(path: "str | Path", obj, *, indent: "int | None" = None, ensure_ascii: bool = True) -> None:

@@ -145,10 +145,8 @@ def test_save_manifest_writes_atomically(tmp_path):
     assert not any(x.name.endswith(".tmp") for x in mpath.parent.iterdir())
 
 
-def test_write_text_atomic_windows_permission_fallback(tmp_path, monkeypatch):
-    """On Windows os.replace raises PermissionError when the destination is
-    briefly locked (antivirus, an open reader); the copy-then-delete fallback
-    must still land the new content and leave no temp file."""
+def test_write_text_atomic_retries_a_transient_permission_error(tmp_path, monkeypatch):
+    """A briefly locked destination retries the atomic replace and succeeds."""
     p = tmp_path / "graph.json"
     p.write_text("original", encoding="utf-8")
 
@@ -157,13 +155,36 @@ def test_write_text_atomic_windows_permission_fallback(tmp_path, monkeypatch):
 
     def flaky_replace(src, dst):
         calls["n"] += 1
-        raise PermissionError("simulated WinError 5")
+        if calls["n"] < 3:
+            raise PermissionError("simulated WinError 5")
+        real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", flaky_replace)
     write_text_atomic(p, "new-content")
 
-    assert calls["n"] == 1  # the fallback path was actually exercised
+    assert calls["n"] == 3
     assert p.read_text() == "new-content"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["graph.json"]
+
+
+def test_write_text_atomic_preserves_destination_after_persistent_permission_error(tmp_path, monkeypatch):
+    """A persistent destination lock does not fall back to copying over it."""
+
+    p = tmp_path / "graph.json"
+    p.write_text("original", encoding="utf-8")
+    calls = {"n": 0}
+
+    def locked_replace(src, dst):
+        calls["n"] += 1
+        raise PermissionError("simulated persistent WinError 5")
+
+    monkeypatch.setattr(os, "replace", locked_replace)
+
+    with pytest.raises(PermissionError, match="persistent"):
+        write_text_atomic(p, "content-that-must-not-land")
+
+    assert calls["n"] == 3
+    assert p.read_text(encoding="utf-8") == "original"
     assert sorted(x.name for x in tmp_path.iterdir()) == ["graph.json"]
 
 
