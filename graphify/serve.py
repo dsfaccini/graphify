@@ -1,14 +1,17 @@
 # MCP stdio server - exposes graph query tools to Claude and other agents
 from __future__ import annotations
 import ipaddress
+import hashlib
+import heapq
 import json
+from itertools import chain
 import math
 import os
 import re
 import sys
 from array import array
 from collections.abc import Iterable
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 import threading
 from typing import NamedTuple
@@ -937,16 +940,46 @@ def _complete_induced_edges(G: nx.Graph, visited: set[str], edges_seen: list[tup
         edges_seen.append((u, v))
 
 
-def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
-    # Compute hub threshold: nodes above this degree are not expanded as transit.
-    # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
-    degrees = [G.degree(n) for n in G.nodes()]
-    if degrees:
-        degrees_sorted = sorted(degrees)
-        p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
+def _hub_threshold(G: nx.Graph) -> int:
+    """Return the exact degree p99 without retaining every graph degree."""
+    signature_hasher = hashlib.blake2b(digest_size=16)
+    node_count = 0
+    for node, degree in G.degree:
+        node_bytes = str(node).encode("utf-8")
+        signature_hasher.update(len(node_bytes).to_bytes(8))
+        signature_hasher.update(node_bytes)
+        signature_hasher.update(degree.to_bytes(8))
+        node_count += 1
+    signature = (node_count, G.number_of_edges(), signature_hasher.digest())
+    cached = G.graph.get("_hub_threshold_cache")
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == signature
+        and isinstance(cached[1], int)
+    ):
+        return cached[1]
+
+    if not node_count:
+        threshold = 50
     else:
-        hub_threshold = 50
+        # ``sorted(degrees)[int(n * .99)]`` is the minimum of the largest
+        # ``n - int(n * .99)`` values. Keep only that small upper tail.
+        upper_tail_size = node_count - int(node_count * 0.99)
+        upper_tail: list[int] = []
+        for _, degree in G.degree:
+            if len(upper_tail) < upper_tail_size:
+                heapq.heappush(upper_tail, degree)
+            elif degree > upper_tail[0]:
+                heapq.heapreplace(upper_tail, degree)
+        threshold = max(50, upper_tail[0])
+
+    G.graph["_hub_threshold_cache"] = (signature, threshold)
+    return threshold
+
+
+def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
+    hub_threshold = _hub_threshold(G)
     seed_set = set(start_nodes)
     visited: set[str] = set(start_nodes)
     frontier = set(start_nodes)
@@ -969,13 +1002,7 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
 
 
 def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
-    degrees = [G.degree(n) for n in G.nodes()]
-    if degrees:
-        degrees_sorted = sorted(degrees)
-        p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
-    else:
-        hub_threshold = 50
+    hub_threshold = _hub_threshold(G)
     seed_set = set(start_nodes)
     visited: set[str] = set()
     edges_seen: list[tuple] = []
@@ -1411,6 +1438,67 @@ def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | Non
     return matches[0], None
 
 
+def _path_neighbors(
+    G: nx.Graph,
+    node: str,
+    *,
+    undirected: bool,
+    node_order: dict[str, int],
+) -> list[str]:
+    """Return canonical next hops without constructing a graph-wide path view."""
+    if undirected:
+        if G.is_directed():
+            return sorted(set(G.successors(node)).union(G.predecessors(node)))
+        return sorted(G.neighbors(node))
+
+    if G.is_directed():
+        edges = chain(G.out_edges(node, data=True), G.in_edges(node, data=True))
+        return sorted({
+            data.get("_tgt", tgt)
+            for src, tgt, data in edges
+            if data.get("_src", src) == node
+        })
+
+    neighbors: set[str] = set()
+    for _, neighbor, data in G.edges(node, data=True):
+        raw_src, raw_tgt = (
+            (node, neighbor)
+            if node_order[node] < node_order[neighbor]
+            else (neighbor, node)
+        )
+        if data.get("_src", raw_src) == node:
+            neighbors.add(data.get("_tgt", raw_tgt))
+    return sorted(neighbors)
+
+
+def _deterministic_shortest_path(
+    G: nx.Graph, source: str, target: str, *, undirected: bool
+) -> list[str] | None:
+    """Find a canonical unweighted shortest path over graph storage in place."""
+    parents: dict[str, str | None] = {source: None}
+    frontier = deque([source])
+    node_order = (
+        {node: index for index, node in enumerate(G.nodes)}
+        if not undirected and not G.is_directed()
+        else {}
+    )
+    while frontier:
+        node = frontier.popleft()
+        if node == target:
+            path: list[str] = []
+            while node is not None:
+                path.append(node)
+                node = parents[node]
+            return list(reversed(path))
+        for neighbor in _path_neighbors(
+            G, node, undirected=undirected, node_order=node_order
+        ):
+            if neighbor not in parents:
+                parents[neighbor] = node
+                frontier.append(neighbor)
+    return None
+
+
 def _shortest_path_text(G: nx.Graph, arguments: dict) -> str:
     """Body of the `shortest_path` MCP tool (module-level so tests can call it
     without an mcp install).
@@ -1450,28 +1538,10 @@ def _shortest_path_text(G: nx.Graph, arguments: dict) -> str:
                 )
     max_hops = int(arguments.get("max_hops", 8))
     undirected = bool(arguments.get("undirected", False))
-    try:
-        # Deterministic path (#2074): the hash-seeded undirected view picked an
-        # arbitrary route among equal-length paths. Build a sorted, materialized
-        # graph so the chosen path is canonical. Serve's shared G is left
-        # untouched (its degree feeds query-seed tie-breaks).
-        if undirected:
-            _und = nx.Graph()
-            _und.add_nodes_from(sorted(G.nodes))
-            _und.add_edges_from(sorted((min(u, v), max(u, v)) for u, v in G.edges()))
-            path_nodes = nx.shortest_path(_und, src_nid, tgt_nid)
-        else:
-            # Directed by default (#2487). True direction is NOT raw arc
-            # order: legacy canonicalized files persist a flipped arc with
-            # _src/_tgt markers (#2309), so build the digraph from _src/_tgt
-            # (falling back to the loaded arc) rather than to_directed().
-            _dg = nx.DiGraph()
-            _dg.add_nodes_from(sorted(G.nodes))
-            _dg.add_edges_from(sorted(
-                (d.get("_src", u), d.get("_tgt", v)) for u, v, d in G.edges(data=True)
-            ))
-            path_nodes = nx.shortest_path(_dg, src_nid, tgt_nid)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
+    path_nodes = _deterministic_shortest_path(
+        G, src_nid, tgt_nid, undirected=undirected
+    )
+    if path_nodes is None:
         src_label = G.nodes[src_nid].get("label", src_nid)
         tgt_label = G.nodes[tgt_nid].get("label", tgt_nid)
         if undirected:

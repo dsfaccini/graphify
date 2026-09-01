@@ -17,6 +17,7 @@ from graphify.serve import (
     _pick_seeds,
     _bfs,
     _dfs,
+    _hub_threshold,
     _find_node,
     _trigrams,
     _node_search_text,
@@ -607,6 +608,36 @@ def test_dfs_full_chain():
     G = _make_graph()
     visited, edges = _dfs(G, ["n1"], depth=5)
     assert {"n1", "n2", "n3", "n4"}.issubset(visited)
+
+
+def test_hub_threshold_is_exact_and_refreshes_after_graph_mutation():
+    G = nx.Graph()
+    G.add_nodes_from(str(i) for i in range(100))
+    G.add_edges_from(("0", str(i)) for i in range(1, 100))
+
+    assert _hub_threshold(G) == 99
+
+    G.add_node("isolated")
+    assert _hub_threshold(G) == 50
+
+
+def test_hub_threshold_keeps_only_the_upper_percentile_tail(monkeypatch):
+    import graphify.serve as serve_mod
+
+    G = nx.Graph()
+    G.add_nodes_from(str(i) for i in range(300))
+    G.add_edges_from(("0", str(i)) for i in range(1, 300))
+    heap_sizes: list[int] = []
+    original_push = serve_mod.heapq.heappush
+
+    def record_push(heap: list[int], value: int) -> None:
+        original_push(heap, value)
+        heap_sizes.append(len(heap))
+
+    monkeypatch.setattr(serve_mod.heapq, "heappush", record_push)
+    _hub_threshold(G)
+
+    assert max(heap_sizes) == 3
 
 
 # --- _subgraph_to_text ---
@@ -1727,6 +1758,98 @@ def test_shortest_path_tool_undirected_opt_in():
     assert "Shortest path (2 hops)" in out
     assert out.count("<--calls--") == 2
     assert "-->" not in out
+
+
+def test_shortest_path_tool_uses_sorted_equal_path_choice():
+    G = nx.DiGraph()
+    for node in ("source", "alpha", "zulu", "target"):
+        G.add_node(node, label=node)
+    # Insert the zulu route first: canonical traversal must still choose alpha.
+    G.add_edges_from([
+        ("source", "zulu", {"relation": "calls"}),
+        ("zulu", "target", {"relation": "calls"}),
+        ("source", "alpha", {"relation": "calls"}),
+        ("alpha", "target", {"relation": "calls"}),
+    ])
+
+    out = _shortest_path_text(G, {"source": "source", "target": "target"})
+
+    assert "source --calls--> alpha --calls--> target" in out
+    assert "zulu" not in out
+
+
+@pytest.mark.parametrize("graph_type", [nx.Graph, nx.MultiGraph])
+def test_shortest_path_tool_markerless_undirected_storage_keeps_raw_direction(graph_type):
+    G = graph_type()
+    for node in ("alpha", "beta", "gamma"):
+        G.add_node(node, label=node)
+    G.add_edge("alpha", "beta", relation="calls")
+    G.add_edge("beta", "gamma", relation="calls")
+
+    forward = _shortest_path_text(G, {"source": "alpha", "target": "gamma"})
+    reverse = _shortest_path_text(G, {"source": "gamma", "target": "alpha"})
+    bounded = _shortest_path_text(
+        G, {"source": "alpha", "target": "gamma", "max_hops": 1}
+    )
+
+    assert "Shortest path (2 hops)" in forward
+    assert "No directed path found" in reverse
+    assert "undirected=true" in reverse
+    assert bounded == "Path exceeds max_hops=1 (2 hops found)."
+
+
+def test_shortest_path_tool_markerless_graph_keeps_canonical_equal_path_choice():
+    G = nx.Graph()
+    for node in ("source", "alpha", "zulu", "target"):
+        G.add_node(node, label=node)
+    G.add_edges_from([
+        ("source", "zulu", {"relation": "calls"}),
+        ("zulu", "target", {"relation": "calls"}),
+        ("source", "alpha", {"relation": "calls"}),
+        ("alpha", "target", {"relation": "calls"}),
+    ])
+
+    out = _shortest_path_text(G, {"source": "source", "target": "target"})
+
+    assert "source --calls--> alpha --calls--> target" in out
+    assert "zulu" not in out
+
+
+def test_shortest_path_tool_follows_stored_direction_not_raw_arc_order():
+    G = nx.DiGraph()
+    for node in ("alpha", "beta", "gamma"):
+        G.add_node(node, label=node)
+    G.add_edge("beta", "alpha", relation="calls", _src="alpha", _tgt="beta")
+    G.add_edge("gamma", "beta", relation="calls", _src="beta", _tgt="gamma")
+
+    out = _shortest_path_text(G, {"source": "alpha", "target": "gamma"})
+
+    assert "Shortest path (2 hops)" in out
+    assert "alpha --calls--> beta --calls--> gamma" in out
+
+
+def test_shortest_path_tool_reports_full_hops_when_max_hops_is_exceeded():
+    out = _shortest_path_text(
+        _directed_chain(), {"source": "alpha", "target": "gamma", "max_hops": 1}
+    )
+
+    assert out == "Path exceeds max_hops=1 (2 hops found)."
+
+
+def test_shortest_path_tool_does_not_materialize_path_graphs(monkeypatch):
+    import graphify.serve as serve_mod
+
+    G = _directed_chain()
+    monkeypatch.setattr(serve_mod.nx, "Graph", pytest.fail)
+    monkeypatch.setattr(serve_mod.nx, "DiGraph", pytest.fail)
+
+    out = _shortest_path_text(
+        G, {"source": "gamma", "target": "alpha", "undirected": True}
+    )
+
+    assert "Shortest path (2 hops)" in out
+
+
 def test_underscore_query_matches_hyphenated_label():
     r"""Separator-blind seeding: `_` must split like `-` does.
 
