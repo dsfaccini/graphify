@@ -11,10 +11,12 @@ from graphify.serve import (
     _communities_from_graph,
     _score_nodes,
     _score_query,
+    _bounded_endpoint_scores,
     _compute_idf,
     _EXACT_MATCH_BONUS,
     _SOURCE_MATCH_BONUS,
     _pick_seeds,
+    _pick_scored_endpoint,
     _bfs,
     _dfs,
     _hub_threshold,
@@ -1477,6 +1479,97 @@ def test_score_query_matches_legacy_under_full_scan_fallback(monkeypatch):
     opt = _score_query(G, terms, collect_per_term_seeds=True)
     assert opt.ranked == _score_nodes(G, terms)
     assert opt.best_seed_by_term == ref_best
+
+
+def test_bounded_query_ranking_matches_full_seed_selection_across_random_graphs():
+    """The query-only path keeps just the three label representatives seeds use."""
+    import random
+
+    rng = random.Random(91)
+    terms_pool = ["foo", "bar", "baz", "get", "user", "router", "service", "widget"]
+    for trial in range(12):
+        G = _make_random_scoring_graph(rng.randint(20, 90), seed=rng.randrange(10**9))
+        terms = [rng.choice(terms_pool) for _ in range(rng.randint(1, 4))]
+        full = _score_query(G, terms, collect_per_term_seeds=True)
+        bounded = _score_query(
+            G,
+            terms,
+            collect_per_term_seeds=True,
+            ranked_limit=3,
+            dedupe_ranked_labels=True,
+        )
+
+        assert len(bounded.ranked) <= 3
+        assert bounded.best_seed_by_term == full.best_seed_by_term
+        assert _pick_seeds(
+            bounded.ranked, G=G, best_seed_by_term=bounded.best_seed_by_term
+        ) == _pick_seeds(full.ranked, G=G, best_seed_by_term=full.best_seed_by_term), trial
+
+
+def test_bounded_query_ranking_preserves_duplicate_labels_ties_and_gap_boundary():
+    G = nx.DiGraph()
+    for index in range(8):
+        G.add_node(f"duplicate-{index}", label="widget", source_file=f"d{index}.py")
+    G.add_node("near", label="widgetry", source_file="near.py")
+    G.add_node("far", label="widow", source_file="far.py")
+
+    full = _score_query(G, ["widget"], collect_per_term_seeds=True)
+    bounded = _score_query(
+        G,
+        ["widget"],
+        collect_per_term_seeds=True,
+        ranked_limit=3,
+        dedupe_ranked_labels=True,
+    )
+
+    assert len(bounded.ranked) <= 3
+    assert _pick_seeds(
+        bounded.ranked, G=G, best_seed_by_term=bounded.best_seed_by_term
+    ) == _pick_seeds(full.ranked, G=G, best_seed_by_term=full.best_seed_by_term)
+
+
+def test_bounded_query_ranking_matches_full_scan_fallback(monkeypatch):
+    _force_full_scan(monkeypatch)
+    G = _make_random_scoring_graph(50, seed=37)
+    terms = ["router", "service", "handler"]
+    full = _score_query(G, terms, collect_per_term_seeds=True)
+    bounded = _score_query(
+        G,
+        terms,
+        collect_per_term_seeds=True,
+        ranked_limit=3,
+        dedupe_ranked_labels=True,
+    )
+
+    assert len(bounded.ranked) <= 3
+    assert _pick_seeds(
+        bounded.ranked, G=G, best_seed_by_term=bounded.best_seed_by_term
+    ) == _pick_seeds(full.ranked, G=G, best_seed_by_term=full.best_seed_by_term)
+
+
+def test_bounded_endpoint_scores_match_full_ranking_override_and_ambiguity():
+    G = nx.DiGraph()
+    G.add_node("decoy", label="Rejection Summary")
+    G.add_node("intended", label="Degenerate Reject-Everything Judge")
+    G.add_node("origin-a", label="origin")
+    G.add_node("origin-b", label="origin")
+    G.add_node("target", label="target")
+    G.add_edge("origin-a", "target", relation="calls")
+
+    for query in ("Reject-everything judge", "origin"):
+        full = _score_nodes(G, [term.lower() for term in query.split()])
+        bounded = _bounded_endpoint_scores(G, query)
+        expected = _pick_scored_endpoint(G, full, query)
+        actual = _pick_scored_endpoint(
+            G, bounded.ranked, query, full_token_match=bounded.full_token_match
+        )
+
+        assert len(bounded.ranked) <= 2
+        assert bounded.ranked == full[:2]
+        assert actual == expected
+
+    out = _shortest_path_text(G, {"source": "origin", "target": "target"})
+    assert "warning: source match was ambiguous" in out
 
 
 def test_query_graph_text_makes_exactly_one_score_query_call(monkeypatch):

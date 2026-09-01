@@ -458,9 +458,11 @@ class _QueryScores(NamedTuple):
     per-token `_score_nodes([token])` rescoring pass — computed in the *same*
     per-node traversal so the query path makes exactly one graph scoring pass
     regardless of query length. Empty when `collect_per_term_seeds=False`.
+    `full_token_match` is populated only for bounded path endpoint scoring.
     """
     ranked: list[tuple[float, str]]
     best_seed_by_term: dict[str, str]
+    full_token_match: str | None = None
 
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
@@ -475,7 +477,13 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
 
 
 def _score_query(
-    G: nx.Graph, terms: list[str], *, collect_per_term_seeds: bool
+    G: nx.Graph,
+    terms: list[str],
+    *,
+    collect_per_term_seeds: bool,
+    ranked_limit: int | None = None,
+    dedupe_ranked_labels: bool = False,
+    full_token_match: set[str] | None = None,
 ) -> _QueryScores:
     """Single-pass combined scorer that optionally also records the best seed
     for each normalized query token.
@@ -502,8 +510,14 @@ def _score_query(
     trigram candidate set (needles `norm_terms + [joined]`) is a superset of
     each per-token `[t]` candidate set, so iterating combined candidates
     discovers every non-zero singleton-score node for every term.
+
+    The optional bounded mode retains only the leading rank representatives a
+    caller needs. It leaves the default full ranking unchanged for public
+    callers through `_score_nodes`.
     """
     scored: list[tuple[float, str]] = []
+    ranked_keys: list[tuple[tuple[float, int, str], str, str]] = []
+    best_full_token_match: tuple[tuple[float, int, str], str] | None = None
     # Dedupe tokens, order-preserving (as _pick_seeds already does): a repeated
     # query word must not double-count every tier, and with coverage scaling
     # below it would also inflate the matched-term ratio (#1602).
@@ -534,6 +548,33 @@ def _score_query(
     best_by_term: dict[str, tuple[tuple, str]] | None = (
         {} if collect_per_term_seeds else None
     )
+
+    def _rank_key(score: float, nid: str, data: dict) -> tuple[float, int, str]:
+        return (-score, len(data.get("label") or nid), nid)
+
+    def _retain_ranked(
+        score: float, nid: str, data: dict, norm_label: str
+    ) -> None:
+        if ranked_limit is None:
+            scored.append((score, nid))
+            return
+        if ranked_limit <= 0:
+            return
+        key = _rank_key(score, nid, data)
+        label_key = norm_label or nid
+        if dedupe_ranked_labels:
+            for index, (existing_key, _existing_nid, existing_label) in enumerate(ranked_keys):
+                if existing_label == label_key:
+                    if key < existing_key:
+                        ranked_keys[index] = (key, nid, label_key)
+                    return
+        if len(ranked_keys) < ranked_limit:
+            ranked_keys.append((key, nid, label_key))
+            return
+        worst_index = max(range(len(ranked_keys)), key=lambda index: ranked_keys[index][0])
+        if key < ranked_keys[worst_index][0]:
+            ranked_keys[worst_index] = (key, nid, label_key)
+
     for nid, data in node_iter:
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
         bare_label = norm_label.rstrip("()")
@@ -634,17 +675,37 @@ def _score_query(
         if tiered:
             score += tiered * (matched / n_terms) ** 2
         if score > 0:
-            scored.append((score, nid))
+            _retain_ranked(score, nid, data, norm_label)
+            if full_token_match and full_token_match <= set(
+                _search_tokens(data.get("label") or nid)
+            ):
+                key = _rank_key(score, nid, data)
+                if best_full_token_match is None or key < best_full_token_match[0]:
+                    best_full_token_match = (key, nid)
     # Sort by score desc; break ties toward the shorter label so a concise exact
     # match beats a longer superset that happens to share the same score.
-    scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
+    if ranked_limit is None:
+        scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
+    else:
+        ranked_keys.sort(key=lambda item: item[0])
+        scored = [(-key[0], nid) for key, nid, _label_key in ranked_keys]
     best_seed_by_term: dict[str, str] = {}
     if collect_per_term_seeds and best_by_term:
         best_seed_by_term = {t: nid for t, (_key, nid) in best_by_term.items()}
-    return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term)
+    return _QueryScores(
+        ranked=scored,
+        best_seed_by_term=best_seed_by_term,
+        full_token_match=(best_full_token_match[1] if best_full_token_match else None),
+    )
 
 
-def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: str) -> str:
+def _pick_scored_endpoint(
+    G: nx.Graph,
+    scored: list[tuple[float, str]],
+    query: str,
+    *,
+    full_token_match: str | None = None,
+) -> str:
     """Pick a path endpoint from a _score_nodes result, preferring full-token matches.
 
     The full-query tier in _score_nodes only fires when the query equals or
@@ -659,6 +720,8 @@ def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: s
 
     `scored` must be non-empty (both callers return early on no match).
     """
+    if full_token_match is not None:
+        return full_token_match
     qtokens = set(_search_tokens(query))
     if not qtokens:
         return scored[0][1]
@@ -666,6 +729,17 @@ def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: s
         if qtokens <= set(_search_tokens(G.nodes[nid].get("label") or nid)):
             return nid
     return scored[0][1]
+
+
+def _bounded_endpoint_scores(G: nx.Graph, query: str) -> _QueryScores:
+    """Retain just the endpoint and ambiguity representatives for a path query."""
+    return _score_query(
+        G,
+        [term.lower() for term in query.split()],
+        collect_per_term_seeds=False,
+        ranked_limit=2,
+        full_token_match=set(_search_tokens(query)),
+    )
 
 
 def _pick_seeds(
@@ -1245,7 +1319,13 @@ def _query_graph_text(
     # — one combined + one per query token — re-walking the whole graph each
     # time; on a 100k-node, three-term benchmark ~71% of scoring time was
     # spent in those redundant per-term passes.
-    qs = _score_query(G, terms, collect_per_term_seeds=True)
+    qs = _score_query(
+        G,
+        terms,
+        collect_per_term_seeds=True,
+        ranked_limit=3,
+        dedupe_ranked_labels=True,
+    )
     # Relational-intent verbs ("calls", "uses", ...) describe the relation the
     # question asks about, not a symbol to seed from; drop them from the
     # per-term seed GUARANTEE so an incidental verb match cannot seat a decoy
@@ -1506,14 +1586,26 @@ def _shortest_path_text(G: nx.Graph, arguments: dict) -> str:
     Directed by default (#2487): the returned path must follow stored
     caller→callee direction; pass ``undirected=True`` to ignore it.
     """
-    src_scored = _score_nodes(G, [t.lower() for t in arguments["source"].split()])
-    tgt_scored = _score_nodes(G, [t.lower() for t in arguments["target"].split()])
+    src_scores = _bounded_endpoint_scores(G, arguments["source"])
+    tgt_scores = _bounded_endpoint_scores(G, arguments["target"])
+    src_scored = src_scores.ranked
+    tgt_scored = tgt_scores.ranked
     if not src_scored:
         return f"No node matching source '{arguments['source']}' found."
     if not tgt_scored:
         return f"No node matching target '{arguments['target']}' found."
-    src_nid = _pick_scored_endpoint(G, src_scored, arguments["source"])
-    tgt_nid = _pick_scored_endpoint(G, tgt_scored, arguments["target"])
+    src_nid = _pick_scored_endpoint(
+        G,
+        src_scored,
+        arguments["source"],
+        full_token_match=src_scores.full_token_match,
+    )
+    tgt_nid = _pick_scored_endpoint(
+        G,
+        tgt_scored,
+        arguments["target"],
+        full_token_match=tgt_scores.full_token_match,
+    )
     # Ambiguity guard: when both queries resolve to the same node, the
     # shortest path is trivially zero hops, which is almost never what the
     # caller wanted (see bug #828).
