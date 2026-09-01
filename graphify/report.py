@@ -5,6 +5,8 @@ from datetime import date
 from pathlib import Path
 import networkx as nx
 
+from graphify.analyze import confidence_stats
+
 
 def _portable_root_label(root: str) -> str:
     """Portable label for the report header — the project directory basename.
@@ -115,15 +117,10 @@ def generate(
     if community_labels:
         community_labels = {int(k) if isinstance(k, str) else k: v for k, v in community_labels.items()}
 
-    confidences = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
-    total = len(confidences) or 1
-    ext_pct = round(confidences.count("EXTRACTED") / total * 100)
-    inf_pct = round(confidences.count("INFERRED") / total * 100)
-    amb_pct = round(confidences.count("AMBIGUOUS") / total * 100)
-
-    inf_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("confidence") == "INFERRED"]
-    inf_scores = [d.get("confidence_score", 0.5) for _, _, d in inf_edges]
-    inf_avg = round(sum(inf_scores) / len(inf_scores), 2) if inf_scores else None
+    confidence = confidence_stats(G)
+    ext_pct = round(confidence.extracted / confidence.total * 100)
+    inf_pct = round(confidence.inferred / confidence.total * 100)
+    amb_pct = round(confidence.ambiguous / confidence.total * 100)
 
     lines = [
         f"# Graph Report - {_portable_root_label(root)}  ({today})",
@@ -165,7 +162,11 @@ def generate(
         f"- {G.number_of_nodes()} nodes · {G.number_of_edges()} edges · {len(communities)} communities"
         + (f" ({shown_count} shown, {thin_count_summary} thin omitted)" if thin_count_summary else ""),
         f"- Extraction: {ext_pct}% EXTRACTED · {inf_pct}% INFERRED · {amb_pct}% AMBIGUOUS"
-        + (f" · INFERRED: {len(inf_edges)} edges (avg confidence: {inf_avg})" if inf_avg is not None else ""),
+        + (
+            f" · INFERRED: {confidence.inferred_count} edges "
+            f"(avg confidence: {confidence.inferred_average})"
+            if confidence.inferred_average is not None else ""
+        ),
         f"- Token cost: {token_cost.get('input', 0):,} input · {token_cost.get('output', 0):,} output",
     ]
 
@@ -275,16 +276,19 @@ def generate(
             f"Nodes ({len(real_nodes)}): {', '.join(display)}{suffix}",
         ]
 
-    ambiguous = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("confidence") == "AMBIGUOUS"]
-    if ambiguous:
-        lines += ["", "## Ambiguous Edges - Review These"]
-        for u, v, d in ambiguous:
-            ul = G.nodes[u].get("label", u)
-            vl = G.nodes[v].get("label", v)
-            lines += [
-                f"- `{ul}` → `{vl}`  [AMBIGUOUS]",
-                f"  {d.get('source_file', '')} · relation: {d.get('relation', 'unknown')}",
-            ]
+    wrote_ambiguous_header = False
+    for u, v, d in G.edges(data=True):
+        if d.get("confidence") != "AMBIGUOUS":
+            continue
+        if not wrote_ambiguous_header:
+            lines += ["", "## Ambiguous Edges - Review These"]
+            wrote_ambiguous_header = True
+        ul = G.nodes[u].get("label", u)
+        vl = G.nodes[v].get("label", v)
+        lines += [
+            f"- `{ul}` → `{vl}`  [AMBIGUOUS]",
+            f"  {d.get('source_file', '')} · relation: {d.get('relation', 'unknown')}",
+        ]
 
     # --- Gaps section ---
     from .analyze import _is_file_node, _is_concept_node

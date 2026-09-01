@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import networkx as nx
 from graphify.build import build_from_json
 from graphify.cluster import cluster, score_all
 from graphify.analyze import god_nodes, surprising_connections
@@ -23,6 +24,39 @@ def test_report_contains_header():
     G, communities, cohesion, labels, gods, surprises, detection, tokens = make_inputs()
     report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, "./project")
     assert "# Graph Report" in report
+
+
+def test_report_confidence_summary_matches_multiedge_defaults_and_unknowns():
+    G = nx.MultiGraph()
+    G.add_edge("a", "b", confidence="EXTRACTED")
+    G.add_edge("a", "b", confidence="INFERRED", confidence_score=0.8)
+    G.add_edge("a", "b", confidence="INFERRED")
+    G.add_edge("a", "b", confidence="AMBIGUOUS")
+    G.add_edge("a", "b", confidence="UNKNOWN")
+    G.add_edge("a", "b")
+
+    report = generate(
+        G, {}, {}, {}, [], [],
+        {"total_files": 1, "total_words": 1, "needs_graph": True, "warning": None},
+        {"input": 0, "output": 0}, ".",
+    )
+
+    assert "Extraction: 33% EXTRACTED · 33% INFERRED · 17% AMBIGUOUS" in report
+    assert "INFERRED: 2 edges (avg confidence: 0.65)" in report
+
+
+def test_report_confidence_summary_keeps_builtin_sum_rounding():
+    G = nx.MultiGraph()
+    for index, score in enumerate((0.8, 0.55, 0.55, 0.8, 0.8, 0.55)):
+        G.add_edge("a", "b", key=index, confidence="INFERRED", confidence_score=score)
+
+    report = generate(
+        G, {}, {}, {}, [], [],
+        {"total_files": 1, "total_words": 1, "needs_graph": True, "warning": None},
+        {"input": 0, "output": 0}, ".",
+    )
+
+    assert "INFERRED: 6 edges (avg confidence: 0.68)" in report
 
 def test_report_contains_corpus_check():
     G, communities, cohesion, labels, gods, surprises, detection, tokens = make_inputs()

@@ -19,6 +19,7 @@ import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap
 from graphify.build import edge_data, edge_datas
+from graphify.analyze import confidence_stats
 from graphify.paths import default_graph_json as _default_graph_json
 
 try:
@@ -2068,15 +2069,14 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
         return "\n".join(lines)
 
     def _tool_graph_stats(_: dict) -> str:
-        confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
-        total = len(confs) or 1
+        confidence = confidence_stats(G)
         return (
             f"Nodes: {G.number_of_nodes()}\n"
             f"Edges: {G.number_of_edges()}\n"
             f"Communities: {len(communities)}\n"
-            f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
-            f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
-            f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
+            f"EXTRACTED: {round(confidence.extracted/confidence.total*100)}%\n"
+            f"INFERRED: {round(confidence.inferred/confidence.total*100)}%\n"
+            f"AMBIGUOUS: {round(confidence.ambiguous/confidence.total*100)}%\n"
         )
 
     def _tool_shortest_path(arguments: dict) -> str:
@@ -2226,13 +2226,12 @@ def _build_server(graph_path: str, *, allow_project_paths: bool = False):
             except Exception as exc:
                 return f"Could not compute surprising connections: {exc}"
         if uri_str == "graphify://audit":
-            confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
-            total = len(confs) or 1
+            confidence = confidence_stats(G)
             return (
-                f"Total edges: {total}\n"
-                f"EXTRACTED: {confs.count('EXTRACTED')} ({round(confs.count('EXTRACTED')/total*100)}%)\n"
-                f"INFERRED: {confs.count('INFERRED')} ({round(confs.count('INFERRED')/total*100)}%)\n"
-                f"AMBIGUOUS: {confs.count('AMBIGUOUS')} ({round(confs.count('AMBIGUOUS')/total*100)}%)\n"
+                f"Total edges: {confidence.total}\n"
+                f"EXTRACTED: {confidence.extracted} ({round(confidence.extracted/confidence.total*100)}%)\n"
+                f"INFERRED: {confidence.inferred} ({round(confidence.inferred/confidence.total*100)}%)\n"
+                f"AMBIGUOUS: {confidence.ambiguous} ({round(confidence.ambiguous/confidence.total*100)}%)\n"
             )
         if uri_str == "graphify://questions":
             try:

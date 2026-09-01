@@ -1,6 +1,8 @@
 """Graph analysis: god nodes (most connected), surprising connections (cross-community), suggested questions."""
 from __future__ import annotations
+import heapq
 from pathlib import Path
+from typing import NamedTuple
 import networkx as nx
 
 from graphify.build import edge_data
@@ -27,6 +29,48 @@ _BUILTIN_NOISE_LABELS = frozenset({
     "NSObject", "NSString", "NSError", "NSLock",
     "View", "Color", "Font", "DispatchQueue",
 })
+
+
+class ConfidenceStats(NamedTuple):
+    """One-pass confidence counters using the established missing-value defaults."""
+    total: int
+    extracted: int
+    inferred: int
+    ambiguous: int
+    inferred_count: int
+    inferred_average: float | None
+
+
+def confidence_stats(G: nx.Graph) -> ConfidenceStats:
+    """Summarize edge confidences without retaining one value per edge."""
+    edge_count = extracted = inferred = ambiguous = inferred_count = 0
+
+    def _inferred_scores():
+        nonlocal edge_count, extracted, inferred, ambiguous, inferred_count
+        for _, _, data in G.edges(data=True):
+            edge_count += 1
+            confidence = data.get("confidence", "EXTRACTED")
+            if confidence == "EXTRACTED":
+                extracted += 1
+            elif confidence == "INFERRED":
+                inferred += 1
+                inferred_count += 1
+                yield data.get("confidence_score", 0.5)
+            elif confidence == "AMBIGUOUS":
+                ambiguous += 1
+
+    inferred_score_total = sum(_inferred_scores())
+    return ConfidenceStats(
+        total=edge_count or 1,
+        extracted=extracted,
+        inferred=inferred,
+        ambiguous=ambiguous,
+        inferred_count=inferred_count,
+        inferred_average=(
+            round(inferred_score_total / inferred_count, 2)
+            if inferred_count else None
+        ),
+    )
 
 # Language families — extensions sharing a runtime can legitimately call each other
 _LANG_FAMILY: dict[str, str] = {
@@ -112,22 +156,33 @@ def god_nodes(G: nx.Graph, top_n: int = 10) -> list[dict]:
     File-level hub nodes are excluded: they accumulate import/contains edges
     mechanically and don't represent meaningful architectural abstractions.
     """
-    degree = dict(G.degree())
-    sorted_nodes = sorted(degree.items(), key=lambda x: x[1], reverse=True)
-    result = []
-    for node_id, deg in sorted_nodes:
+    # The historical loop appends before checking the limit, so zero and
+    # negative top_n values return the first real node rather than an empty list.
+    limit = max(top_n, 1)
+    retained: list[tuple[int, int, str]] = []
+    for insertion_index, (node_id, deg) in enumerate(G.degree()):
         if _is_file_node(G, node_id) or _is_concept_node(G, node_id) or _is_json_key_node(G, node_id):
             continue
         if G.nodes[node_id].get("label", "") in _BUILTIN_NOISE_LABELS:
             continue
-        result.append({
+        # A min-heap keeps the worst retained entry at the root: lower degree,
+        # then later insertion order. That makes equal-degree output preserve
+        # the stable graph insertion order of the old full sort.
+        entry = (deg, -insertion_index, node_id)
+        if len(retained) < limit:
+            heapq.heappush(retained, entry)
+        elif entry > retained[0]:
+            heapq.heapreplace(retained, entry)
+
+    retained.sort(key=lambda entry: (-entry[0], -entry[1]))
+    return [
+        {
             "id": node_id,
             "label": G.nodes[node_id].get("label", node_id),
             "degree": deg,
-        })
-        if len(result) >= top_n:
-            break
-    return result
+        }
+        for deg, _insertion_index, node_id in retained
+    ]
 
 
 def surprising_connections(

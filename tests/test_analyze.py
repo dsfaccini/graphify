@@ -5,7 +5,7 @@ import pytest
 from pathlib import Path
 from graphify.build import build_from_json
 from graphify.cluster import cluster
-from graphify.analyze import god_nodes, surprising_connections, _is_concept_node, graph_diff, _surprise_score, _file_category, _is_json_key_node, find_import_cycles, suggest_questions
+from graphify.analyze import confidence_stats, god_nodes, surprising_connections, _is_concept_node, graph_diff, _surprise_score, _file_category, _is_json_key_node, find_import_cycles, suggest_questions
 from graphify.extract import _make_id
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -35,6 +35,86 @@ def test_god_nodes_have_required_keys():
     assert "id" in result[0]
     assert "label" in result[0]
     assert "degree" in result[0]
+
+
+def _god_nodes_oracle(G: nx.Graph, top_n: int) -> list[dict]:
+    from graphify.analyze import _BUILTIN_NOISE_LABELS, _is_file_node
+
+    result = []
+    for node_id, degree in sorted(dict(G.degree()).items(), key=lambda item: item[1], reverse=True):
+        if _is_file_node(G, node_id) or _is_concept_node(G, node_id) or _is_json_key_node(G, node_id):
+            continue
+        if G.nodes[node_id].get("label", "") in _BUILTIN_NOISE_LABELS:
+            continue
+        result.append({"id": node_id, "label": G.nodes[node_id].get("label", node_id), "degree": degree})
+        if len(result) >= top_n:
+            break
+    return result
+
+
+def test_god_nodes_bounded_heap_matches_old_order_including_ties_and_edges():
+    G = nx.MultiGraph()
+    for node in ("first", "second", "third", "noise"):
+        G.add_node(node, label=("str" if node == "noise" else node), source_file=f"{node}.py")
+    for index in range(4):
+        G.add_edge("first", f"a{index}")
+        G.add_edge("second", f"b{index}")
+    G.add_edge("third", "c")
+    G.add_edge("noise", "d")
+
+    for limit in (1, 2, 10, 0, -3):
+        assert god_nodes(G, top_n=limit) == _god_nodes_oracle(G, limit)
+
+
+def test_god_nodes_heap_retention_is_bounded(monkeypatch):
+    import graphify.analyze as analyze_mod
+
+    G = nx.Graph()
+    for index in range(12):
+        G.add_node(f"n{index}", label=f"n{index}", source_file=f"n{index}.py")
+        for leaf in range(index):
+            G.add_edge(f"n{index}", f"leaf-{index}-{leaf}")
+    sizes: list[int] = []
+    original_push = analyze_mod.heapq.heappush
+
+    def record_push(heap: list[tuple[int, int, str]], entry: tuple[int, int, str]) -> None:
+        original_push(heap, entry)
+        sizes.append(len(heap))
+
+    monkeypatch.setattr(analyze_mod.heapq, "heappush", record_push)
+    god_nodes(G, top_n=3)
+
+    assert max(sizes) == 3
+
+
+def test_confidence_stats_preserves_defaults_unknowns_and_multiedges():
+    G = nx.MultiGraph()
+    G.add_edge("a", "b", confidence="EXTRACTED")
+    G.add_edge("a", "b", confidence="INFERRED", confidence_score=0.8)
+    G.add_edge("a", "b", confidence="INFERRED")
+    G.add_edge("a", "b", confidence="AMBIGUOUS")
+    G.add_edge("a", "b", confidence="UNKNOWN")
+    G.add_edge("a", "b")
+
+    assert confidence_stats(G)._asdict() == {
+        "total": 6,
+        "extracted": 2,
+        "inferred": 2,
+        "ambiguous": 1,
+        "inferred_count": 2,
+        "inferred_average": 0.65,
+    }
+    assert confidence_stats(nx.Graph()).total == 1
+
+
+def test_confidence_stats_keeps_builtin_sum_rounding_without_retaining_scores():
+    G = nx.MultiGraph()
+    for index, score in enumerate((0.8, 0.55, 0.55, 0.8, 0.8, 0.55)):
+        G.add_edge("a", "b", key=index, confidence="INFERRED", confidence_score=score)
+
+    assert confidence_stats(G).inferred_average == round(sum(
+        (0.8, 0.55, 0.55, 0.8, 0.8, 0.55)
+    ) / 6, 2) == 0.68
 
 
 def test_surprising_connections_cross_source_multi_file():

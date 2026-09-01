@@ -286,6 +286,32 @@ def test_http_query_response_is_utf8_bounded_and_sanitized(tmp_path):
     assert len(text.encode("utf-8")) <= 1200
 
 
+def test_http_graph_stats_uses_missing_and_unknown_confidence_defaults(tmp_path):
+    graph = {
+        "directed": True,
+        "nodes": [{"id": node, "label": node, "community": 0} for node in "abcdefg"],
+        "edges": [
+            {"source": "a", "target": "b", "confidence": "EXTRACTED"},
+            {"source": "b", "target": "c", "confidence": "INFERRED"},
+            {"source": "c", "target": "d", "confidence": "AMBIGUOUS"},
+            {"source": "d", "target": "e", "confidence": "UNKNOWN"},
+            {"source": "e", "target": "f"},
+        ],
+    }
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    app = serve_mod._build_http_app(str(graph_path), json_response=True)
+
+    with _client(app) as client:
+        text = _call_tool(client, _init_session(client), "graph_stats", {}, rid=2)
+
+    assert text.splitlines()[-3:] == [
+        "EXTRACTED: 40%",
+        "INFERRED: 20%",
+        "AMBIGUOUS: 20%",
+    ]
+
+
 def test_http_query_rejects_injected_mode_before_rendering(tmp_path):
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
