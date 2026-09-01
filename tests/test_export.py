@@ -5,7 +5,15 @@ import tempfile
 from pathlib import Path
 from graphify.build import build_from_json
 from graphify.cluster import cluster
-from graphify.export import to_json, to_cypher, to_graphml, to_html, to_canvas, to_obsidian
+from graphify.export import (
+    _graph_json_data,
+    to_canvas,
+    to_cypher,
+    to_graphml,
+    to_html,
+    to_json,
+    to_obsidian,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -71,6 +79,67 @@ def test_to_json_sorts_graph_collections_across_insertion_order(tmp_path):
         )
 
     assert outputs[0].read_bytes() == outputs[1].read_bytes()
+
+
+def test_graph_json_data_matches_to_json_across_graph_shapes(tmp_path):
+    """The in-memory builder and public writer must emit the same graph mapping."""
+    import networkx as nx
+
+    communities = {0: ["a", "b"], 1: ["c"]}
+    labels = {0: "Core", 1: "Leaf"}
+    expected_by_shape: dict[bool, dict] = {}
+    for directed in (False, True):
+        for reverse in (False, True):
+            graph = nx.DiGraph() if directed else nx.Graph()
+            nodes = [
+                ("b", {"label": "Béta"}),
+                ("a", {"label": "Alpha"}),
+                ("c", {"label": "Gamma"}),
+            ]
+            links = [
+                ("b", "a", {"relation": "calls", "_src": "b", "_tgt": "a"}),
+                ("a", "c", {"relation": "uses", "_src": "a", "_tgt": "c"}),
+            ]
+            graph.add_nodes_from(reversed(nodes) if reverse else nodes)
+            graph.add_edges_from(reversed(links) if reverse else links)
+            hyperedges = [
+                {"id": "h2", "nodes": ["b", "c"]},
+                {"id": "h1", "nodes": ["a", "b"]},
+            ]
+            graph.graph["hyperedges"] = list(reversed(hyperedges)) if reverse else hyperedges
+
+            candidate = _graph_json_data(
+                graph,
+                communities,
+                built_at_commit="fixed",
+                community_labels=labels,
+            )
+            output = tmp_path / f"{'directed' if directed else 'undirected'}-{reverse}.json"
+            assert to_json(
+                graph,
+                communities,
+                str(output),
+                force=True,
+                built_at_commit="fixed",
+                community_labels=labels,
+            )
+            assert json.loads(output.read_text(encoding="utf-8")) == candidate
+
+            if reverse:
+                assert candidate == expected_by_shape[directed]
+            else:
+                expected_by_shape[directed] = candidate
+            assert candidate["directed"] is directed
+            assert candidate["built_at_commit"] == "fixed"
+            assert candidate["hyperedges"] == [
+                {"id": "h1", "nodes": ["a", "b"]},
+                {"id": "h2", "nodes": ["b", "c"]},
+            ]
+            assert all(node["community_name"] in {"Core", "Leaf"} for node in candidate["nodes"])
+            assert any(
+                link["source"] == "b" and link["target"] == "a"
+                for link in candidate["links"]
+            )
 
 
 def test_to_json_field_order_stable_across_read_rebuild(tmp_path):

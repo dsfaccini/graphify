@@ -1459,7 +1459,7 @@ def _rebuild_code(
         from graphify.cluster import cluster, remap_communities_to_previous, score_all
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
-        from graphify.export import to_json
+        from graphify.export import _graph_json_data
 
         # Re-apply the excludes the initial extract recorded, so an update/watch/
         # hook rebuild does not silently re-include deliberately excluded paths
@@ -2062,11 +2062,12 @@ def _rebuild_code(
                           built_at_commit=commit, learning=_llfr(out / "graph.json"))
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
-        graph_tmp = out / ".graph.tmp.json"
-        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
-        if not json_written:
-            return False
-        candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
+        candidate_graph_data = _graph_json_data(
+            G,
+            communities,
+            built_at_commit=commit,
+            community_labels=labels,
+        )
         same_graph = False
         same_report = False
         if existing_snapshot is not None:
@@ -2082,19 +2083,16 @@ def _rebuild_code(
             same_report = _report_for_compare(old_report) == _report_for_compare(report)
         no_change = same_graph and same_report
         if no_change:
-            graph_tmp.unlink(missing_ok=True)
             print("[graphify watch] No code-graph changes detected; graph.json/GRAPH_REPORT.md left untouched.")
         else:
             if not _check_shrink(
                 force, existing_graph_data, candidate_graph_data,
-                tmp=graph_tmp,
                 had_explicit_deletions=bool(deleted_paths),
                 rebuilt_sources=rebuilt_sources,
                 failed_sources=failed_sources,
             ):
                 return False
             if not _snapshot_is_current(existing_graph, existing_snapshot):
-                graph_tmp.unlink(missing_ok=True)
                 print(
                     f"error: {existing_graph} changed during rebuild. "
                     "Refusing to overwrite; retry the rebuild.",
@@ -2107,7 +2105,8 @@ def _rebuild_code(
             (out / _HTML_STALE_MARKER).touch()
             from graphify.export import backup_if_protected as _backup
             _backup(out)
-            graph_tmp.replace(existing_graph)
+            from graphify.paths import write_json_atomic
+            write_json_atomic(existing_graph, candidate_graph_data, indent=2)
             report_path.write_text(report, encoding="utf-8")
             labels_file.write_text(labels_json, encoding="utf-8")
             # Keep the membership signatures in step with the labels we just wrote.

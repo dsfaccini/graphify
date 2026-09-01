@@ -263,6 +263,72 @@ def existing_graph_node_count(path: "str | Path"):
     return len(nodes) if isinstance(nodes, list) else MALFORMED_GRAPH
 
 
+def _graph_json_data(
+    G: nx.Graph,
+    communities: dict[int, list[str]],
+    *,
+    built_at_commit: str | None,
+    community_labels: dict[int, str] | None = None,
+) -> dict:
+    """Build canonical node-link JSON data using resolved graph provenance."""
+    node_community = _node_community_map(communities)
+    labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
+    try:
+        data = json_graph.node_link_data(G, edges="links")
+    except TypeError:
+        data = json_graph.node_link_data(G)
+
+    def _json_sort_key(item: dict) -> str:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    for node in data["nodes"]:
+        cid = node_community.get(node["id"])
+        node["community"] = cid
+        if cid is not None and labels:
+            node["community_name"] = labels.get(cid, f"Community {cid}")
+        node["norm_label"] = _strip_diacritics(node.get("label", "")).lower()
+    for link in data["links"]:
+        if "confidence_score" not in link:
+            conf = link.get("confidence", "EXTRACTED")
+            link["confidence_score"] = _CONFIDENCE_SCORE_DEFAULTS.get(conf, 1.0)
+        # Restore original edge direction. Undirected NetworkX storage may
+        # canonicalize endpoint order, flipping `calls` and other directional
+        # edges in graph.json. The build path stashes the true endpoints in
+        # _src/_tgt for exactly this purpose (#563).
+        true_src = link.pop("_src", None)
+        true_tgt = link.pop("_tgt", None)
+        if true_src is not None and true_tgt is not None:
+            link["source"] = true_src
+            link["target"] = true_tgt
+    # Canonicalize the key order WITHIN each node/link dict. node_link_data always
+    # appends the node key (`id`) at the end, so a node whose `id` was an inline
+    # attribute on a cold build (position varies) lands last after a read-rebuild
+    # (build_from_json consumes `id` as the pure node key). The values are
+    # identical either way, but the field order churns, so a byte-diff of two
+    # equivalent graph.json files is noisy and any position-sensitive consumer
+    # sees a spurious change on every round-trip. Emit a stable order — the
+    # identity keys first, then the remaining keys sorted — so the serialized
+    # form is invariant regardless of how the attribute was stored in memory.
+    def _canonical(item: dict, lead: tuple[str, ...]) -> dict:
+        leading = [k for k in lead if k in item]
+        rest = sorted(k for k in item if k not in leading)
+        return {k: item[k] for k in (*leading, *rest)}
+
+    data["nodes"] = [_canonical(node, ("id", "label")) for node in data["nodes"]]
+    data["links"] = [
+        _canonical(link, ("source", "target", "relation")) for link in data["links"]
+    ]
+    data["nodes"].sort(key=_json_sort_key)
+    data["links"].sort(key=_json_sort_key)
+    hyperedges = sorted(getattr(G, "graph", {}).get("hyperedges", []), key=_json_sort_key)
+    if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
+        data["graph"]["hyperedges"] = hyperedges
+    data["hyperedges"] = hyperedges
+    if built_at_commit:
+        data["built_at_commit"] = built_at_commit
+    return data
+
+
 def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
@@ -320,53 +386,6 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 )
                 return False
 
-    node_community = _node_community_map(communities)
-    _labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
-    try:
-        data = json_graph.node_link_data(G, edges="links")
-    except TypeError:
-        data = json_graph.node_link_data(G)
-
-    def _json_sort_key(item: dict) -> str:
-        return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-    for node in data["nodes"]:
-        cid = node_community.get(node["id"])
-        node["community"] = cid
-        if cid is not None and _labels:
-            node["community_name"] = _labels.get(cid, f"Community {cid}")
-        node["norm_label"] = _strip_diacritics(node.get("label", "")).lower()
-    for link in data["links"]:
-        if "confidence_score" not in link:
-            conf = link.get("confidence", "EXTRACTED")
-            link["confidence_score"] = _CONFIDENCE_SCORE_DEFAULTS.get(conf, 1.0)
-        # Restore original edge direction. Undirected NetworkX storage may
-        # canonicalize endpoint order, flipping `calls` and other directional
-        # edges in graph.json. The build path stashes the true endpoints in
-        # _src/_tgt for exactly this purpose (#563).
-        true_src = link.pop("_src", None)
-        true_tgt = link.pop("_tgt", None)
-        if true_src is not None and true_tgt is not None:
-            link["source"] = true_src
-            link["target"] = true_tgt
-    # Canonicalize the key order WITHIN each node/link dict. node_link_data always
-    # appends the node key (`id`) at the end, so a node whose `id` was an inline
-    # attribute on a cold build (position varies) lands last after a read-rebuild
-    # (build_from_json consumes `id` as the pure node key). The values are
-    # identical either way, but the field order churns, so a byte-diff of two
-    # equivalent graph.json files is noisy and any position-sensitive consumer
-    # sees a spurious change on every round-trip. Emit a stable order — the
-    # identity keys first, then the remaining keys sorted — so the serialized
-    # form is invariant regardless of how the attribute was stored in memory.
-    def _canonical(item: dict, lead: tuple[str, ...]) -> dict:
-        leading = [k for k in lead if k in item]
-        rest = sorted(k for k in item if k not in leading)
-        return {k: item[k] for k in (*leading, *rest)}
-
-    data["nodes"] = [_canonical(n, ("id", "label")) for n in data["nodes"]]
-    data["links"] = [_canonical(link, ("source", "target", "relation")) for link in data["links"]]
-    data["nodes"].sort(key=_json_sort_key)
-    data["links"].sort(key=_json_sort_key)
     if "hyperedges" not in getattr(G, "graph", {}):
         # Hardening (#2485): a graph with NO hyperedges key at all was built by
         # a path that never engaged hyperedge metadata — distinct from an
@@ -395,16 +414,16 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 f"extraction if this is unexpected.",
                 file=sys.stderr,
             )
-    hyperedges = sorted(getattr(G, "graph", {}).get("hyperedges", []), key=_json_sort_key)
-    if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
-        data["graph"]["hyperedges"] = hyperedges
-    data["hyperedges"] = hyperedges
     # Fallback provenance comes from the repo the graph is being written INTO
     # (output_path lives in <target>/graphify-out/), never the shell's cwd —
     # the same cwd-anchoring mistake #2316 fixed for `update`.
     commit = built_at_commit if built_at_commit is not None else _git_head(Path(output_path).resolve().parent)
-    if commit:
-        data["built_at_commit"] = commit
+    data = _graph_json_data(
+        G,
+        communities,
+        built_at_commit=commit,
+        community_labels=community_labels,
+    )
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
     write_json_atomic(output_path, data, indent=2)

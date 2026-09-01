@@ -254,11 +254,7 @@ def test_graphify_root_preserves_relative_when_invoked_with_relative_path(tmp_pa
 
 
 def test_rebuild_code_writes_community_name(tmp_path):
-    """#1808: `graphify update` / _rebuild_code must forward community_labels to
-    to_json, so graph.json nodes carry a human-readable community_name (hub-derived
-    for a code-only rebuild) — not just a numeric community id. Before the fix,
-    _rebuild_code called to_json without community_labels, so the labels a
-    cluster-only pass writes were stripped again on every incremental rebuild."""
+    """#1808: clustered rebuilds preserve human-readable community labels."""
     import json
     from graphify.watch import _rebuild_code
 
@@ -279,6 +275,65 @@ def test_rebuild_code_writes_community_name(tmp_path):
         "clustered nodes missing community_name — the update rebuild stripped the "
         "labels that cluster-only writes (#1808)"
     )
+
+
+def test_clustered_rebuild_serializes_accepted_graph_once_without_graph_tmp(tmp_path, monkeypatch):
+    """The clustered candidate stays in memory until all acceptance checks pass."""
+    import graphify.export as export_mod
+    import graphify.paths as paths_mod
+    import graphify.watch as watch_mod
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    app = corpus / "app.py"
+    app.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    assert watch_mod._rebuild_code(corpus, acquire_lock=False) is True
+
+    out = corpus / "graphify-out"
+    graph_path = out / "graph.json"
+    graph_writes: list[tuple[Path, int | None, bool]] = []
+    real_write_json = paths_mod.write_json_atomic
+    real_read_text = Path.read_text
+    real_write_text = Path.write_text
+
+    def unexpected_to_json(*args, **kwargs):
+        raise AssertionError("clustered watch rebuild must not call to_json")
+
+    def watch_write_json(path, obj, *, indent=None, ensure_ascii=True):
+        target = Path(path)
+        assert target.name != ".graph.tmp.json"
+        if target == graph_path:
+            graph_writes.append((target, indent, ensure_ascii))
+        return real_write_json(path, obj, indent=indent, ensure_ascii=ensure_ascii)
+
+    def reject_tmp_read(self, *args, **kwargs):
+        if self.name == ".graph.tmp.json":
+            raise AssertionError("clustered watch rebuild must not read .graph.tmp.json")
+        return real_read_text(self, *args, **kwargs)
+
+    def reject_tmp_write(self, *args, **kwargs):
+        if self.name == ".graph.tmp.json":
+            raise AssertionError("clustered watch rebuild must not write .graph.tmp.json")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(export_mod, "to_json", unexpected_to_json)
+    monkeypatch.setattr(paths_mod, "write_json_atomic", watch_write_json)
+    monkeypatch.setattr(Path, "read_text", reject_tmp_read)
+    monkeypatch.setattr(Path, "write_text", reject_tmp_write)
+
+    app.write_text(
+        "def alpha():\n    return beta()\n\ndef beta():\n    return 2\n",
+        encoding="utf-8",
+    )
+    assert watch_mod._rebuild_code(corpus, changed_paths=[app], acquire_lock=False) is True
+
+    assert graph_writes == [(graph_path, 2, True)]
+    assert not (out / ".graph.tmp.json").exists()
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert {node["label"] for node in graph["nodes"]} >= {"alpha()", "beta()"}
+    assert all(node.get("community_name") for node in graph["nodes"])
+    assert (out / "GRAPH_REPORT.md").exists()
+    assert (out / "graph.html").exists()
 
 
 def test_rebuild_code_drops_labels_whose_community_changed(tmp_path):
@@ -1449,11 +1504,27 @@ def test_rebuild_refuses_loss_from_failed_source(tmp_path, monkeypatch, no_clust
     )
     existing = {"nodes": existing_nodes, "links": []}
     graph_path.write_text(json.dumps(existing), encoding="utf-8")
+    before = graph_path.read_bytes()
+    if not no_cluster:
+        import graphify.paths as paths_mod
+
+        writes: list[Path] = []
+        real_write_json = paths_mod.write_json_atomic
+
+        def count_write_json(path, obj, *, indent=None, ensure_ascii=True):
+            writes.append(Path(path))
+            return real_write_json(path, obj, indent=indent, ensure_ascii=ensure_ascii)
+
+        monkeypatch.setattr(paths_mod, "write_json_atomic", count_write_json)
     monkeypatch.setitem(sys.modules, "tree_sitter_sql", None)
 
     ok = _rebuild_code(tmp_path, force=False, no_cluster=no_cluster)
 
     assert ok is False
+    if not no_cluster:
+        assert writes == [], "refused clustered rebuild must not serialize its candidate"
+        assert not (out / ".graph.tmp.json").exists()
+    assert graph_path.read_bytes() == before
     assert json.loads(graph_path.read_text(encoding="utf-8")) == existing
 
 
@@ -3073,8 +3144,9 @@ def test_incremental_rebuild_reuses_snapshot_and_restamps_legacy_metadata(
     assert all(link.get("_origin") for link in restamped["links"])
 
 
+@pytest.mark.parametrize("no_cluster", [True, False], ids=["no-cluster", "clustered"])
 def test_incremental_rebuild_refuses_graph_changed_after_snapshot(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, no_cluster
 ):
     """A graph replaced after comparison must not be overwritten by a stale rebuild."""
     import graphify.watch as watch_mod
@@ -3083,7 +3155,7 @@ def test_incremental_rebuild_refuses_graph_changed_after_snapshot(
     corpus.mkdir()
     app = corpus / "app.py"
     app.write_text("def first():\n    return 1\n", encoding="utf-8")
-    assert watch_mod._rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    assert watch_mod._rebuild_code(corpus, no_cluster=no_cluster, acquire_lock=False) is True
 
     graph_path = corpus / "graphify-out" / "graph.json"
     external_graph = json.dumps({
@@ -3097,14 +3169,25 @@ def test_incremental_rebuild_refuses_graph_changed_after_snapshot(
         return True
 
     monkeypatch.setattr(watch_mod, "_check_shrink", replace_after_check)
+    import graphify.paths as paths_mod
+
+    writes: list[Path] = []
+    real_write_json = paths_mod.write_json_atomic
+
+    def count_write_json(path, obj, *, indent=None, ensure_ascii=True):
+        writes.append(Path(path))
+        return real_write_json(path, obj, indent=indent, ensure_ascii=ensure_ascii)
+
+    monkeypatch.setattr(paths_mod, "write_json_atomic", count_write_json)
     app.write_text(
         "def first():\n    return 1\n\n\ndef second():\n    return 2\n",
         encoding="utf-8",
     )
     assert watch_mod._rebuild_code(
-        corpus, changed_paths=[app], no_cluster=True, acquire_lock=False,
+        corpus, changed_paths=[app], no_cluster=no_cluster, acquire_lock=False,
     ) is False
     assert graph_path.read_text(encoding="utf-8") == external_graph
+    assert writes == []
     assert not (corpus / "graphify-out" / ".graph.tmp.json").exists()
     assert "changed during rebuild" in capsys.readouterr().err
 
