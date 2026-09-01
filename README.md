@@ -503,7 +503,7 @@ The MCP server gives your assistant structured access: `query_graph`, `get_node`
 | `--stateless` | off | No per-session state (for load-balanced / CI deployments) |
 | `--session-timeout` | `3600` | Reap idle stateful sessions after N seconds (`0` disables) |
 
-The default `127.0.0.1` bind is loopback-only. Set `--host 0.0.0.0` **and** `--api-key` together when exposing on a shared host. Run it in a container:
+The default `127.0.0.1` bind is loopback-only. A non-loopback bind requires a nonblank `--api-key` (or `GRAPHIFY_API_KEY`) and otherwise fails at startup. HTTP clients can query only the graph configured when the server starts; `project_path` remains available to local stdio clients. Run it in a container:
 
 ```bash
 docker build -t graphify .

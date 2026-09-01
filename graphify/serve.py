@@ -1,5 +1,6 @@
 # MCP stdio server - exposes graph query tools to Claude and other agents
 from __future__ import annotations
+import ipaddress
 import json
 import math
 import os
@@ -1540,7 +1541,7 @@ def _community_header(cid: int, community_name) -> str:
     return base
 
 
-def _build_server(graph_path: str):
+def _build_server(graph_path: str, *, allow_project_paths: bool = False):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
@@ -1563,8 +1564,8 @@ def _build_server(graph_path: str):
     from graphify import paths as _paths
 
     # Graph contexts comprise one pinned configured default plus a bounded LRU
-    # of project_path graphs. This preserves the configured graph's warm index
-    # while preventing a shared server from retaining every project it serves.
+    # of stdio-selected project graphs. This preserves the configured graph's
+    # warm index while preventing a local server from retaining every project.
     _default_graph_path = str(Path(graph_path).resolve())
     _ctx_cache = _GraphContextCache(_max_server_contexts())
 
@@ -1742,24 +1743,23 @@ def _build_server(graph_path: str):
                 },
             ),
         ]
-        # Multi-project support: every tool accepts an optional project_path.
-        # Injected here (rather than repeated in 11 literal schemas) so the set
-        # stays in lockstep as tools are added. Omitting it keeps the historical
-        # single-graph behaviour, so this is purely additive for existing callers.
-        for _t in _tools:
-            # The constructor accepts the camelCase alias in both majors, but
-            # attribute access is inputSchema on mcp 1.x and input_schema on 2.x.
-            _schema = getattr(_t, "inputSchema", None)
-            if _schema is None:
-                _schema = _t.input_schema
-            _schema.setdefault("properties", {})["project_path"] = {
-                "type": "string",
-                "description": (
-                    "Absolute path to a project directory containing "
-                    "graphify-out/graph.json. Optional — defaults to the graph "
-                    "this server was started with."
-                ),
-            }
+        if allow_project_paths:
+            # Local stdio clients run with the caller's filesystem authority.
+            # Keep this additive compatibility field out of HTTP schemas.
+            for _t in _tools:
+                # The constructor accepts the camelCase alias in both majors, but
+                # attribute access is inputSchema on mcp 1.x and input_schema on 2.x.
+                _schema = getattr(_t, "inputSchema", None)
+                if _schema is None:
+                    _schema = _t.input_schema
+                _schema.setdefault("properties", {})["project_path"] = {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to a project directory containing "
+                        "graphify-out/graph.json. Optional — defaults to the graph "
+                        "this server was started with."
+                    ),
+                }
         return _tools
 
     def _tool_query_graph(arguments: dict) -> str:
@@ -2069,6 +2069,8 @@ def _build_server(graph_path: str):
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         arguments = dict(arguments or {})
         project_path = arguments.pop("project_path", None)
+        if project_path is not None and not allow_project_paths:
+            raise ToolError("project_path is only supported over stdio")
         handler = _handlers.get(name)
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -2080,6 +2082,8 @@ def _build_server(graph_path: str):
             # isError:true (the mcp 1.x decorator wraps a raised exception into
             # an error result; the 2.x path catches it in _on_call_tool).
             raise
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise ToolError(f"Error executing {name}: {exc}") from exc
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
 
@@ -2144,7 +2148,7 @@ def serve(graph_path: str | None = None) -> None:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
     import asyncio
 
-    server = _build_server(graph_path)
+    server = _build_server(graph_path, allow_project_paths=True)
 
     async def main() -> None:
         async with stdio_server() as streams:
@@ -2211,6 +2215,34 @@ class _ApiKeyMiddleware:
         await self.app(scope, receive, send)
 
 
+def _normalize_api_key(api_key: str | None) -> str | None:
+    """Return a nonblank API key, or ``None`` when authentication is disabled."""
+    return (api_key or "").strip() or None
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_wildcard_host(host: str) -> bool:
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
+def _validate_http_bind(host: str, api_key: str | None) -> None:
+    if not _is_loopback_host(host) and api_key is None:
+        raise ValueError("HTTP binding outside loopback requires --api-key")
+
+
 def _build_http_app(
     graph_path: str,
     *,
@@ -2247,17 +2279,16 @@ def _build_http_app(
             'Run: pip install "graphifyy[mcp]"'
         ) from e
 
-    # A blank key (e.g. --api-key "" or an empty GRAPHIFY_API_KEY) must not be
-    # mistaken for "auth on" — normalize it to None so the gate is unambiguous.
-    api_key = (api_key or "").strip() or None
+    api_key = _normalize_api_key(api_key)
+    _validate_http_bind(host, api_key)
 
-    server = _build_server(graph_path)
+    server = _build_server(graph_path, allow_project_paths=False)
 
     # DNS-rebinding protection. When the operator binds a wildcard address they
     # are intentionally exposing the server, so accept any Host header; for a
     # loopback/specific bind, restrict Host to that address (with and without
     # the port) plus the localhost aliases.
-    if host in ("0.0.0.0", "::", ""):
+    if _is_wildcard_host(host):
         security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     else:
         allowed = {host, "localhost", "127.0.0.1"}
@@ -2316,6 +2347,8 @@ def serve_http(
     localhost — set an api_key when you do.
     """
     graph_path = graph_path or _default_graph_json()
+    api_key = _normalize_api_key(api_key)
+    _validate_http_bind(host, api_key)
     try:
         import uvicorn
     except ImportError as e:
@@ -2323,8 +2356,6 @@ def serve_http(
             'HTTP transport needs the mcp extra (mcp + starlette + uvicorn). '
             'Run: pip install "graphifyy[mcp]"'
         ) from e
-
-    api_key = (api_key or "").strip() or None
 
     app = _build_http_app(
         graph_path,
@@ -2342,12 +2373,6 @@ def serve_http(
         f"graphify MCP server (streamable-http) on http://{host}:{port}{path} - {auth_note}",
         file=sys.stderr,
     )
-    if host in ("0.0.0.0", "::", "") and not api_key:
-        print(
-            f"WARNING: binding {host or '0.0.0.0'} with no api-key exposes the graph "
-            "unauthenticated on the network. Set --api-key (or GRAPHIFY_API_KEY).",
-            file=sys.stderr,
-        )
     uvicorn.run(app, host=host, port=port)
 
 
@@ -2406,11 +2431,16 @@ def _main(argv: list[str] | None = None) -> None:
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
     if args.transport == "http":
+        api_key = _normalize_api_key(args.api_key)
+        try:
+            _validate_http_bind(args.host, api_key)
+        except ValueError as exc:
+            parser.error(str(exc))
         serve_http(
             graph_path,
             host=args.host,
             port=args.port,
-            api_key=args.api_key,
+            api_key=api_key,
             path=args.path,
             json_response=args.json_response,
             stateless=args.stateless,
