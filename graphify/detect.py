@@ -2395,6 +2395,9 @@ def detect_incremental(
         semantically.
     kind="ast": a file is "changed" when its ast_hash is missing or its
         content has changed. Use this for `graphify update`.
+    kind="auto": code uses ast_hash while every non-code file uses
+        semantic_hash. Use this for a mixed incremental corpus when code is
+        structurally extracted and documents are semantically extracted.
 
     Fast path: mtime unchanged + hash matches → unchanged (free, no disk IO
     beyond stat). Slow path: mtime bumped → compare MD5 against the relevant
@@ -2455,9 +2458,17 @@ def detect_incremental(
                 # Normalise legacy {mtime, hash} to new schema
                 if "hash" in stored and "ast_hash" not in stored:
                     stored = {"mtime": stored.get("mtime", 0), "ast_hash": stored["hash"], "semantic_hash": ""}
-                hash_key = "semantic_hash" if kind == "semantic" else "ast_hash"
+                if kind == "auto":
+                    hash_key = (
+                        "ast_hash" if ftype == FileType.CODE else "semantic_hash"
+                    )
+                else:
+                    # Keep the legacy default and non-semantic fallback intact:
+                    # callers that omitted kind still receive semantic behavior.
+                    hash_key = "semantic_hash" if kind == "semantic" else "ast_hash"
                 stored_hash = stored.get(hash_key, "")
-                # Missing semantic_hash means update ran but extract hasn't — always re-extract
+                # A missing selected-tier hash means its extractor has not
+                # completed — always re-extract.
                 if not stored_hash:
                     changed = True
                 else:

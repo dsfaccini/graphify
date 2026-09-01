@@ -9,10 +9,10 @@ Use when you've added or modified files since the last run. Only re-extracts cha
 ```bash
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
-from graphify.detect import detect_incremental, save_manifest
+from graphify.detect import detect_incremental
 from pathlib import Path
 
-result = detect_incremental(Path('INPUT_PATH'))
+result = detect_incremental(Path('INPUT_PATH'), kind='auto')
 new_total = result.get('new_total', 0)
 print(json.dumps(result, indent=2, ensure_ascii=False))
 Path('graphify-out/.graphify_incremental.json').write_text(json.dumps(result, ensure_ascii=False), encoding=\"utf-8\")
@@ -63,7 +63,7 @@ print('code_only:', code_only)
 
 If `code_only` is True: print `[graphify update] Code-only changes detected - skipping semantic extraction (no LLM needed)`, run only Step 3A (AST) on the changed files, skip Step 3B entirely (no subagents), then go straight to merge and Steps 4–8.
 
-If `code_only` is False (any changed file is a doc/paper/image/video): **first, if any changed file is in `new_files['video']`, run `references/transcribe.md` (Step 2.5) on those files, then rewrite `.graphify_detect.json` to move the resulting transcript paths into `files['document']` and drop `files['video']`** — otherwise raw `.mp4/.mp3` paths are fed to semantic subagents as unreadable media (#1392). Then run the full Steps 3A–3C pipeline as normal.
+If `code_only` is False (any changed file is a doc/paper/image/video): first run `references/transcribe.md` when `new_files['video']` is non-empty. The reference adds successful transcripts to `files['document']` and retains original media in `files['video']` for Step 9. Then run the full Steps 3A–3C pipeline as normal.
 
 
 If no new files exist (only deletions), create an empty extraction so the merge step can prune:
@@ -87,10 +87,13 @@ $(cat graphify-out/.graphify_python) -c "
 import json
 from pathlib import Path
 from graphify.build import build_merge
-from graphify.detect import save_manifest
 
 # Load new extraction and incremental state
 new_extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
+# Keep fresh extraction provenance before build_merge carries forward prior nodes.
+Path('graphify-out/.graphify_incremental_fresh.json').write_text(
+    json.dumps(new_extraction, ensure_ascii=False), encoding=\"utf-8\"
+)
 incremental = json.loads(Path('graphify-out/.graphify_incremental.json').read_text(encoding=\"utf-8\"))
 deleted = list(incremental.get('deleted_files', []))
 # prune_sources is ONLY for genuinely DELETED files. Changed/re-extracted files are
@@ -137,31 +140,6 @@ merged_out = {
 Path('graphify-out/.graphify_extract.json').write_text(json.dumps(merged_out, ensure_ascii=False), encoding=\"utf-8\")
 print(f'[graphify update] Merged extraction written ({len(merged_out[\"nodes\"])} nodes, {len(merged_out[\"edges\"])} edges)')
 
-# Save manifest so next --update diffs against today's state, not the
-# prior run's baseline (prevents ghost-node reports on subsequent updates).
-# root= matches the build_merge call above so the manifest keys stay relative to
-# the scan root — portable across clones/machines, so --update keeps matching
-# cached files instead of missing every one after a move (#1417).
-#
-# Only stamp semantic files (docs/papers/images) that ACTUALLY produced output
-# THIS run (new_extraction is this run's fresh extraction, read above before the
-# merge overwrote the file): a changed doc whose chunk failed must stay unstamped
-# so the next --update re-queues it, otherwise it is marked done and its content
-# is lost forever (#2015). Mirrors the library extract path
-# (cli._stamped_manifest_files + clear_semantic + scan_corpus).
-from graphify.cli import _stamped_manifest_files
-_manifest_files = _stamped_manifest_files(incremental['files'], new_extraction, Path('INPUT_PATH'))
-# Changed semantic files dispatched this run but NOT stamped had their chunk fail
-# or be omitted; clear any stale semantic_hash so they are re-queued (#1948).
-_sem_types = ('document', 'paper', 'image')
-_dispatched = {f for t, fl in incremental.get('new_files', {}).items() if t in _sem_types for f in fl}
-_stamped = {f for fl in _manifest_files.values() for f in fl}
-_cleared = _dispatched - _stamped
-# scan_corpus = the RAW full corpus so in-root files newly excluded since last run
-# are dropped rather than masquerading as deletions; untouched rows preserved (#1908).
-_scan = {f for fl in incremental['files'].values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
-print('[graphify update] Manifest saved.')
 "
 ```
 

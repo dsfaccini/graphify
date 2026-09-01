@@ -353,7 +353,7 @@ def transcribe(
     else:
         audio_path = Path(video_path)
 
-    transcript_path = out_dir / (audio_path.stem + ".txt")
+    transcript_path = _transcript_cache_path(video_path, audio_path, out_dir)
     if transcript_path.exists() and not force:
         return transcript_path
 
@@ -378,14 +378,40 @@ def transcribe(
     return transcript_path
 
 
+def _transcript_cache_path(
+    video_path: Path | str,
+    audio_path: Path,
+    output_dir: Path,
+) -> Path:
+    """Return a collision-safe transcript path for the original media source.
+
+    Local files key by canonical path; URLs key by their original text. A legacy
+    stem-only transcript is intentionally not considered because two sources can
+    share a stem and its provenance cannot be recovered safely.
+    """
+    source = str(video_path)
+    if is_url(source):
+        identity = source
+    else:
+        try:
+            identity = str(Path(source).expanduser().resolve())
+        except OSError:
+            identity = str(Path(source).expanduser().absolute())
+    source_hash = hashlib.sha1(
+        identity.encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()[:12]
+    return output_dir / f"{audio_path.stem}-{source_hash}.txt"
+
+
 def transcribe_all(
     video_files: list[str],
     output_dir: Path | None = None,
     initial_prompt: str | None = None,
+    force: bool = False,
 ) -> list[str]:
     """Transcribe a list of video/audio files or URLs, return paths to transcript .txt files.
 
-    Already-transcribed files are returned from cache instantly.
+    Already-transcribed files are returned from cache unless force is true.
     initial_prompt is shared across all files — built once from corpus god nodes.
     """
     if not video_files:
@@ -394,7 +420,7 @@ def transcribe_all(
     transcript_paths = []
     for vf in video_files:
         try:
-            t = transcribe(vf, output_dir, initial_prompt=initial_prompt)
+            t = transcribe(vf, output_dir, initial_prompt=initial_prompt, force=force)
             transcript_paths.append(str(t))
         except Exception as exc:
             print(f"  warning: could not transcribe {vf}: {exc}")

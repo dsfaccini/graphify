@@ -1032,13 +1032,159 @@ def _is_manifest_stamp_fix_line(line: str) -> bool:
         or stripped.startswith((
             "_corpus =",
             "_manifest_files =",
+            "_code_files =",
             "_sem_types =",
+            "_semantic_files =",
             "_dispatched =",
             "_stamped =",
             "_cleared =",
             "_scan =",
         ))
+        or stripped.startswith("# Stamp the AST tier")
         or (stripped.startswith("#") and "#2015" in stripped)
+    )
+
+
+def _is_manifest_auto_kind_fix_line(line: str) -> bool:
+    """Whether a line selects manifest tiers during an incremental scan.
+
+    Mixed incremental updates use the AST hash for code and semantic hashes for
+    non-code files. The two affected runbook lines are the detector import and
+    its ``kind='auto'`` call.
+    """
+    return line.strip() in {
+        "from graphify.detect import detect_incremental, save_manifest",
+        "from graphify.detect import detect_incremental",
+        "result = detect_incremental(Path('INPUT_PATH'))",
+        "result = detect_incremental(Path('INPUT_PATH'), kind='auto')",
+    }
+
+
+def _is_manifest_fresh_output_fix_line(line: str) -> bool:
+    """Whether a line preserves fresh semantic/media provenance in Step 9.
+
+    Incremental graph merging carries nodes from the prior graph, so the manifest
+    must derive semantic stamps from the fresh extraction, not the merged output.
+    Video/audio sources additionally need their original path stamped only after
+    their successful transcript appears in that fresh output. This explicit,
+    narrow allowlist covers both the removed list-only transcript handoff and the
+    replacement media-to-transcript mapping.
+    """
+    stripped = line.strip()
+    return (
+        stripped in {
+            "media_to_transcript = {}",
+            "for media_path in video_files:",
+            "transcript_paths = transcribe_all([media_path], initial_prompt=prompt)",
+            "if transcript_paths:",
+            "media_to_transcript[media_path] = transcript_paths[0]",
+            "documents = detect.setdefault('files', {}).setdefault('document', [])",
+            "for transcript_path in media_to_transcript.values():",
+            "if transcript_path not in documents:",
+            "documents.append(transcript_path)",
+            "print(f'Transcribed {len(media_to_transcript)} file(s)')",
+            "transcript_paths = transcribe_all(video_files, initial_prompt=prompt)",
+            "print(json.dumps(transcript_paths))",
+            '\" > graphify-out/.graphify_transcripts.json',
+            "if not isinstance(_media_to_transcript, dict):",
+            "The rewritten detect file retains the original media in files['video'] for",
+            "Step 9; only successfully transcribed paths are added to files['document'].",
+        }
+        or stripped.startswith((
+            "Path('graphify-out/.graphify_transcripts.json').write_text(json.dumps(media_to_transcript",
+            "Path('graphify-out/.graphify_detect.json').write_text(json.dumps(detect",
+            "_fresh_path =",
+            "_fresh_output =",
+            "_manifest_corpus =",
+            "_transcripts_path =",
+            "_media_to_transcript =",
+            "_media_dispatched =",
+            "_transcript_paths =",
+            "_media_files =",
+            "_media_stamped =",
+            "_semantic_manifest_files =",
+        ))
+        or stripped.startswith("# Stamp semantic sources only when fresh output")
+        or stripped.startswith("# merges carry prior nodes, so use the preserved fresh output")
+    )
+
+
+def _is_monolith_incremental_contract_fix_line(line: str) -> bool:
+    """Whether a monolith line implements the shared incremental contract.
+
+    Aider and Devin keep their update instructions inline. They therefore need
+    the same changed-files/full-corpus handoff, forced changed-media transcript,
+    fresh-extraction snapshot, and build_merge serialization as split hosts.
+    """
+    stripped = line.strip()
+    return (
+        stripped in {
+            "import json",
+            "import sys, json",
+            "from graphify.build import build_from_json",
+            "from graphify.build import build_merge",
+            "from graphify.export import to_json",
+            "from networkx.readwrite import json_graph",
+            "import networkx as nx",
+            "force = bool(detect.get('all_files'))",
+            "G = build_merge(",
+            "[new_extraction],",
+            "prune_sources=prune,",
+            "merged_out = {",
+            "'edges': [",
+            "for u, v, d in G.edges(data=True)",
+            "],",
+            "}",
+            '}))',
+            ")",
+            "# Load existing graph",
+            "# Load new extraction",
+            "# Merge: new nodes/edges into existing graph",
+            "G_existing.update(G_new)",
+        }
+        or (
+            stripped.startswith("If ")
+            and "code_only" in stripped
+            and "doc/paper/image" in stripped
+        )
+        or stripped.startswith((
+            "detect = json.loads(Path('.graphify_detect.json').read_text())",
+            "transcript_paths = transcribe_all([media_path], initial_prompt=prompt, force=force)",
+            "Path('.graphify_transcripts.json').write_text(json.dumps(media_to_transcript",
+            "Path('.graphify_detect.json').write_text(json.dumps(detect",
+            "Path('.graphify_detect.json').write_text(json.dumps({",
+            "Path('graphify-out/.graphify_detect.json').write_text(json.dumps({",
+            "'files': result.get('new_files'",
+            "'all_files': result.get('files'",
+            "'total_files': result.get('new_total'",
+            "'total_words': result.get('total_words'",
+            "'skipped_sensitive': result.get('skipped_sensitive'",
+            "'needs_graph': True,",
+            "if [ ! -f .graphify_extract.json ]; then",
+            "Path('.graphify_extract.json').write_text(json.dumps(",
+            "Path('.graphify_incremental_fresh.json').write_text(",
+            "Path('graphify-out/.graphify_incremental_fresh.json').write_text(",
+            "incremental = json.loads(Path('.graphify_incremental.json').read_text())",
+            "incremental = json.loads(Path('graphify-out/.graphify_incremental.json').read_text())",
+            "prune = list(incremental.get('deleted_files'",
+            "graph_path='graphify-out/graph.json',",
+            "root='INPUT_PATH',",
+            "'nodes': [{'id': n, **d} for n, d in G.nodes(data=True)],",
+            "{**{k: value for k, value in d.items()",
+            "'source': d.get('_src', u), 'target': d.get('_tgt', v)}",
+            "'hyperedges': list(G.graph.get('hyperedges'",
+            "'input_tokens': new_extraction.get('input_tokens'",
+            "'output_tokens': new_extraction.get('output_tokens'",
+            "Path('.graphify_extract.json').write_text(json.dumps(merged_out",
+            "Path('graphify-out/.graphify_extract.json').write_text(json.dumps(merged_out",
+            "print(f'[graphify update] Merged:",
+            "detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text())",
+            "existing_data = json.loads(Path('graphify-out/graph.json').read_text())",
+            "G_existing = json_graph.node_link_graph(",
+            "print(f'Merged: {G_existing.number_of_nodes()}",
+            "if [ ! -f graphify-out/.graphify_extract.json ]; then",
+            "Path('graphify-out/.graphify_extract.json').write_text(json.dumps(",
+        ))
     )
 
 
@@ -1156,6 +1302,9 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_zero_node_guard_fix_line,
     _is_manifest_root_fix_line,
     _is_manifest_stamp_fix_line,
+    _is_manifest_auto_kind_fix_line,
+    _is_manifest_fresh_output_fix_line,
+    _is_monolith_incremental_contract_fix_line,
     _is_sensitive_reporting_fix_line,
     _is_no_api_key_fix_line,
     _is_shebang_allowlist_fix_line,

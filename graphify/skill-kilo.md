@@ -572,28 +572,34 @@ extract = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encod
 # so the on-disk manifest is portable across clones/machines and a later --update
 # matches cached files instead of missing every one (#1417).
 #
-# Only stamp semantic files (docs/papers/images) that ACTUALLY produced output:
-# a detected file whose chunk failed or was omitted must stay unstamped so the
-# next --update re-queues it, otherwise it is marked done and its content is lost
-# forever (#2015). This mirrors the library extract path exactly
-# (cli._stamped_manifest_files + clear_semantic + scan_corpus); do not stamp the
-# raw corpus. Code files are always stamped (AST is deterministic); only semantic
-# types are gated on output.
+# Stamp the AST tier for the full detected code corpus. Stamp semantic sources
+# only when fresh semantic output contains their source. Incremental merges carry
+# prior nodes, so use the preserved fresh output instead of merged extraction.
 from graphify.cli import _stamped_manifest_files
 _corpus = detect.get('all_files') or detect['files']
-_manifest_files = _stamped_manifest_files(_corpus, extract, Path('INPUT_PATH'))
-# Files dispatched this run (the changed subset) but NOT stamped above still carry
-# a stale semantic_hash from a prior run; clear it so detect_incremental re-queues
-# them instead of reading them as unchanged (#1948).
+_fresh_path = Path('graphify-out/.graphify_incremental_fresh.json')
+_fresh_output = json.loads(_fresh_path.read_text(encoding=\"utf-8\")) if detect.get('all_files') and _fresh_path.is_file() else (extract if not detect.get('all_files') else {'nodes': [], 'edges': [], 'hyperedges': []})
+_code_files = {'code': _corpus.get('code', [])}
 _sem_types = ('document', 'paper', 'image')
+_transcripts_path = Path('graphify-out/.graphify_transcripts.json')
+_media_to_transcript = json.loads(_transcripts_path.read_text(encoding=\"utf-8\")) if _transcripts_path.is_file() else {}
+if not isinstance(_media_to_transcript, dict):
+    _media_to_transcript = {}
+_media_dispatched = set(detect['files'].get('video', []))
+_media_to_transcript = {media_path: transcript_path for media_path, transcript_path in _media_to_transcript.items() if media_path in _media_dispatched}
+_transcript_paths = set(_media_to_transcript.values())
+_manifest_corpus = {**_corpus, 'document': [*_corpus.get('document', []), *[transcript_path for transcript_path in _media_to_transcript.values() if transcript_path not in _corpus.get('document', [])]]}
+_manifest_files = _stamped_manifest_files(_manifest_corpus, _fresh_output, Path('INPUT_PATH'))
+_semantic_files = {t: [f for f in _manifest_files.get(t, []) if f not in _transcript_paths] for t in _sem_types}
 _dispatched = {f for t, fl in detect['files'].items() if t in _sem_types for f in fl}
-_stamped = {f for fl in _manifest_files.values() for f in fl}
-_cleared = _dispatched - _stamped
-# scan_corpus = the RAW full corpus (not the stamp-filtered subset) so in-root
-# files newly excluded since last run are dropped rather than masquerading as
-# deletions; untouched files' prior rows are still preserved (#1908).
-_scan = {f for fl in _corpus.values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
+_stamped = {f for t in _sem_types for f in _manifest_files.get(t, [])}
+_media_files = {'video': [media_path for media_path in _media_dispatched if _media_to_transcript.get(media_path) in _stamped]}
+_media_stamped = set(_media_files['video'])
+_cleared = (_dispatched - _stamped) | (_media_dispatched - _media_stamped)
+_scan = {f for fl in _corpus.values() for f in fl if f not in _transcript_paths}
+_semantic_manifest_files = {**_semantic_files, **_media_files}
+save_manifest(_code_files, kind='ast', root='INPUT_PATH', scan_corpus=_scan)
+save_manifest(_semantic_manifest_files, kind='semantic', root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
 
 # Update cumulative cost tracker
 input_tok = extract.get('input_tokens', 0)
@@ -618,7 +624,7 @@ cost_path.write_text(json.dumps(cost, indent=2, ensure_ascii=False), encoding=\"
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json
+rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json graphify-out/.graphify_incremental_fresh.json graphify-out/.graphify_transcripts.json
 find graphify-out -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```

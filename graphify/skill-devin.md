@@ -170,10 +170,20 @@ from graphify.transcribe import transcribe_all
 detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
 video_files = detect.get('files', {}).get('video', [])
 prompt = os.environ.get('GRAPHIFY_WHISPER_PROMPT', 'Use proper punctuation and paragraph breaks.')
+force = bool(detect.get('all_files'))
 
-transcript_paths = transcribe_all(video_files, initial_prompt=prompt)
-print(json.dumps(transcript_paths))
-" > graphify-out/.graphify_transcripts.json
+media_to_transcript = {}
+for media_path in video_files:
+    transcript_paths = transcribe_all([media_path], initial_prompt=prompt, force=force)
+    if transcript_paths:
+        media_to_transcript[media_path] = transcript_paths[0]
+Path('graphify-out/.graphify_transcripts.json').write_text(json.dumps(media_to_transcript, ensure_ascii=False))
+documents = detect.setdefault('files', {}).setdefault('document', [])
+for transcript_path in media_to_transcript.values():
+    if transcript_path not in documents:
+        documents.append(transcript_path)
+Path('graphify-out/.graphify_detect.json').write_text(json.dumps(detect, ensure_ascii=False))
+print(f'Transcribed {len(media_to_transcript)} file(s)')
 ```
 
 After transcription:
@@ -181,6 +191,9 @@ After transcription:
 - Add them to the docs list before dispatching semantic subagents in Step 3B
 - Print how many transcripts were created: `Transcribed N video file(s) -> treating as docs`
 - If transcription fails for a file, print a warning and continue with the rest
+
+The rewritten detect file retains the original media in files['video'] for
+Step 9; only successfully transcribed paths are added to files['document'].
 
 **Whisper model:** Default is `base`. If the user passed `--whisper-model <name>`, set `GRAPHIFY_WHISPER_MODEL=<name>` in the environment before running the command above.
 
@@ -803,16 +816,33 @@ from graphify.detect import save_manifest
 # Save manifest for --update
 detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
 extract = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
-# Stamp only semantic files that produced output so a failed chunk is re-queued next run, not lost (#2015).
+# Stamp semantic sources only when fresh output contains their source. Incremental
+# merges carry prior nodes, so use the preserved fresh output instead.
 from graphify.cli import _stamped_manifest_files
 _corpus = detect.get('all_files') or detect['files']
-_manifest_files = _stamped_manifest_files(_corpus, extract, Path('INPUT_PATH'))
+_fresh_path = Path('graphify-out/.graphify_incremental_fresh.json')
+_fresh_output = json.loads(_fresh_path.read_text()) if detect.get('all_files') and _fresh_path.is_file() else (extract if not detect.get('all_files') else {'nodes': [], 'edges': [], 'hyperedges': []})
+_code_files = {'code': _corpus.get('code', [])}
 _sem_types = ('document', 'paper', 'image')
+_transcripts_path = Path('graphify-out/.graphify_transcripts.json')
+_media_to_transcript = json.loads(_transcripts_path.read_text()) if _transcripts_path.is_file() else {}
+if not isinstance(_media_to_transcript, dict):
+    _media_to_transcript = {}
+_media_dispatched = set(detect['files'].get('video', []))
+_media_to_transcript = {media_path: transcript_path for media_path, transcript_path in _media_to_transcript.items() if media_path in _media_dispatched}
+_transcript_paths = set(_media_to_transcript.values())
+_manifest_corpus = {**_corpus, 'document': [*_corpus.get('document', []), *[transcript_path for transcript_path in _media_to_transcript.values() if transcript_path not in _corpus.get('document', [])]]}
+_manifest_files = _stamped_manifest_files(_manifest_corpus, _fresh_output, Path('INPUT_PATH'))
+_semantic_files = {t: [f for f in _manifest_files.get(t, []) if f not in _transcript_paths] for t in _sem_types}
 _dispatched = {f for t, fl in detect['files'].items() if t in _sem_types for f in fl}
-_stamped = {f for fl in _manifest_files.values() for f in fl}
-_cleared = _dispatched - _stamped
-_scan = {f for fl in _corpus.values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
+_stamped = {f for t in _sem_types for f in _manifest_files.get(t, [])}
+_media_files = {'video': [media_path for media_path in _media_dispatched if _media_to_transcript.get(media_path) in _stamped]}
+_media_stamped = set(_media_files['video'])
+_cleared = (_dispatched - _stamped) | (_media_dispatched - _media_stamped)
+_scan = {f for fl in _corpus.values() for f in fl if f not in _transcript_paths}
+_semantic_manifest_files = {**_semantic_files, **_media_files}
+save_manifest(_code_files, kind='ast', root='INPUT_PATH', scan_corpus=_scan)
+save_manifest(_semantic_manifest_files, kind='semantic', root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
 
 # Update cumulative cost tracker
 input_tok = extract.get('input_tokens', 0)
@@ -837,7 +867,7 @@ cost_path.write_text(json.dumps(cost, indent=2))
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json graphify-out/.graphify_labels.json graphify-out/.graphify_incremental.json graphify-out/.graphify_transcripts.json graphify-out/.graphify_old.json; find graphify-out -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
+rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json graphify-out/.graphify_labels.json graphify-out/.graphify_incremental.json graphify-out/.graphify_incremental_fresh.json graphify-out/.graphify_transcripts.json graphify-out/.graphify_old.json; find graphify-out -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
@@ -900,13 +930,21 @@ Use when you've added or modified files since the last run. Only re-extracts cha
 ```bash
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
-from graphify.detect import detect_incremental, save_manifest
+from graphify.detect import detect_incremental
 from pathlib import Path
 
-result = detect_incremental(Path('INPUT_PATH'))
+result = detect_incremental(Path('INPUT_PATH'), kind='auto')
 new_total = result.get('new_total', 0)
 print(json.dumps(result, indent=2))
 Path('graphify-out/.graphify_incremental.json').write_text(json.dumps(result))
+Path('graphify-out/.graphify_detect.json').write_text(json.dumps({
+    'files': result.get('new_files', {}),
+    'all_files': result.get('files', {}),
+    'total_files': result.get('new_total', 0),
+    'total_words': result.get('total_words', 0),
+    'skipped_sensitive': result.get('skipped_sensitive', []),
+    'needs_graph': True,
+}))
 deleted = list(result.get('deleted_files', []))
 if new_total == 0 and not deleted:
     print('No files changed since last run. Nothing to update.')
@@ -936,7 +974,7 @@ print('code_only:', code_only)
 
 If `code_only` is True: print `[graphify update] Code-only changes detected - skipping semantic extraction (no LLM needed)`, run only Step 3A (AST) on the changed files, skip Step 3B entirely (no subagents), then go straight to merge and Steps 4-8.
 
-If `code_only` is False (any changed file is a doc/paper/image): run the full Steps 3A-3C pipeline as normal.
+If `code_only` is False (any changed file is a doc/paper/image/video): run Step 2.5 when `new_files['video']` is non-empty. The incremental detect file forces fresh transcripts for changed media. Then run the full Steps 3A-3C pipeline.
 
 If no new files exist (only deletions), create an empty extraction so the merge step can prune:
 
@@ -955,24 +993,34 @@ Then:
 
 ```bash
 $(cat graphify-out/.graphify_python) -c "
-import sys, json
-from graphify.build import build_from_json
-from graphify.export import to_json
-from networkx.readwrite import json_graph
-import networkx as nx
+import json
 from pathlib import Path
+from graphify.build import build_merge
 
-# Load existing graph
-existing_data = json.loads(Path('graphify-out/graph.json').read_text())
-G_existing = json_graph.node_link_graph(existing_data, edges='links')
-
-# Load new extraction
 new_extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
-G_new = build_from_json(new_extraction, directed=IS_DIRECTED)
-
-# Merge: new nodes/edges into existing graph
-G_existing.update(G_new)
-print(f'Merged: {G_existing.number_of_nodes()} nodes, {G_existing.number_of_edges()} edges')
+Path('graphify-out/.graphify_incremental_fresh.json').write_text(json.dumps(new_extraction, ensure_ascii=False))
+incremental = json.loads(Path('graphify-out/.graphify_incremental.json').read_text())
+prune = list(incremental.get('deleted_files', [])) or None
+G = build_merge(
+    [new_extraction],
+    graph_path='graphify-out/graph.json',
+    prune_sources=prune,
+    root='INPUT_PATH',
+    directed=IS_DIRECTED,
+)
+merged_out = {
+    'nodes': [{'id': n, **d} for n, d in G.nodes(data=True)],
+    'edges': [
+        {**{k: value for k, value in d.items() if k not in ('_src', '_tgt', 'source', 'target')},
+         'source': d.get('_src', u), 'target': d.get('_tgt', v)}
+        for u, v, d in G.edges(data=True)
+    ],
+    'hyperedges': list(G.graph.get('hyperedges', [])),
+    'input_tokens': new_extraction.get('input_tokens', 0),
+    'output_tokens': new_extraction.get('output_tokens', 0),
+}
+Path('graphify-out/.graphify_extract.json').write_text(json.dumps(merged_out, ensure_ascii=False))
+print(f'[graphify update] Merged: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges')
 "
 ```
 

@@ -1989,6 +1989,236 @@ def test_save_manifest_clear_semantic_erases_stale_hash_for_omitted_file(tmp_pat
     )
 
 
+def test_full_build_manifest_stamps_ast_and_semantic_tiers(tmp_path):
+    """The runbook's full-build stamps select the tier appropriate to each type."""
+    import json
+
+    code = tmp_path / "app.py"
+    doc = tmp_path / "guide.md"
+    code.write_text("def app():\n    return 1\n", encoding="utf-8")
+    doc.write_text("# Guide\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    corpus = {str(code), str(doc)}
+
+    save_manifest(
+        {"code": [str(code)]}, manifest_path, kind="ast", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    save_manifest(
+        {"document": [str(doc)]}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus,
+    )
+
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert manifest["app.py"]["ast_hash"]
+    assert manifest["app.py"]["semantic_hash"] == ""
+    assert manifest["guide.md"]["ast_hash"] == ""
+    assert manifest["guide.md"]["semantic_hash"]
+
+
+def test_detect_incremental_auto_uses_the_matching_tier_per_file(tmp_path):
+    """Mixed incremental scans use AST hashes for code and semantic hashes for docs."""
+    code = tmp_path / "app.py"
+    doc = tmp_path / "guide.md"
+    code.write_text("def app():\n    return 1\n", encoding="utf-8")
+    doc.write_text("# Guide\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    corpus = {str(code), str(doc)}
+
+    save_manifest(
+        {"code": [str(code)]}, manifest_path, kind="ast", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    save_manifest(
+        {"document": [str(doc)]}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus,
+    )
+
+    unchanged = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert unchanged["new_total"] == 0
+
+    # The public default remains semantic for API compatibility: code's absent
+    # semantic stamp still requests semantic extraction when callers omit kind.
+    default_semantic = detect_incremental(tmp_path, manifest_path)
+    assert [Path(f).name for f in default_semantic["new_files"]["code"]] == ["app.py"]
+    assert default_semantic["new_files"]["document"] == []
+
+    code.write_text("def app():\n    return 2\n", encoding="utf-8")
+    code_change = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert [Path(f).name for f in code_change["new_files"]["code"]] == ["app.py"]
+    assert code_change["new_files"]["document"] == []
+
+    save_manifest(
+        {"code": [str(code)]}, manifest_path, kind="ast", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    doc.write_text("# Guide\n\nUpdated\n", encoding="utf-8")
+    doc_change = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert doc_change["new_files"]["code"] == []
+    assert [Path(f).name for f in doc_change["new_files"]["document"]] == ["guide.md"]
+
+
+def test_incremental_tiered_manifest_requeues_missing_semantic_output(tmp_path):
+    """An omitted semantic result clears only that tier for the next auto scan."""
+    code = tmp_path / "app.py"
+    doc = tmp_path / "guide.md"
+    code.write_text("def app():\n    return 1\n", encoding="utf-8")
+    doc.write_text("# Guide\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    corpus = {str(code), str(doc)}
+
+    save_manifest(
+        {"code": [str(code)]}, manifest_path, kind="ast", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    save_manifest(
+        {"document": [str(doc)]}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus,
+    )
+
+    doc.write_text("# Guide\n\nChanged\n", encoding="utf-8")
+    # The update's AST pass still stamps the full code corpus. Its semantic
+    # extractor omitted the dispatched document, so only the semantic stamp
+    # must be cleared before the next mixed incremental scan.
+    save_manifest(
+        {"code": [str(code)]}, manifest_path, kind="ast", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    save_manifest(
+        {"document": []}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus, clear_semantic={str(doc)},
+    )
+
+    retry = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert retry["new_files"]["code"] == []
+    assert [Path(f).name for f in retry["new_files"]["document"]] == ["guide.md"]
+
+
+def test_incremental_manifest_uses_fresh_not_merged_semantic_output(tmp_path):
+    """A prior graph node cannot stamp a changed doc after fresh extraction fails."""
+    from graphify.cli import _stamped_manifest_files
+
+    doc = tmp_path / "guide.md"
+    doc.write_text("# Guide\n\nInitial\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    corpus = {str(doc)}
+    save_manifest(
+        {"document": [str(doc)]}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus,
+    )
+
+    doc.write_text("# Guide\n\nChanged\n", encoding="utf-8")
+    # build_merge may carry this old node forward even though the current semantic
+    # extraction produced nothing for guide.md. Step 9 must use fresh_output.
+    merged_output = {
+        "nodes": [{"id": "old-guide", "source_file": str(doc)}],
+        "edges": [],
+        "hyperedges": [],
+    }
+    fresh_output = {"nodes": [], "edges": [], "hyperedges": []}
+    files = {"document": [str(doc)]}
+    assert _stamped_manifest_files(files, merged_output, tmp_path)["document"] == [str(doc)]
+    fresh_files = _stamped_manifest_files(files, fresh_output, tmp_path)
+    assert fresh_files["document"] == []
+
+    save_manifest(
+        fresh_files, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus, clear_semantic={str(doc)},
+    )
+    retry = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert [Path(f).name for f in retry["new_files"]["document"]] == ["guide.md"]
+
+
+def test_auto_video_manifest_requires_current_transcript_semantic_success(tmp_path):
+    """Media is warm only after its current transcript succeeds; stale maps are inert."""
+    from graphify.cli import _stamped_manifest_files
+
+    video = tmp_path / "lecture.mp3"
+    video.write_bytes(b"initial audio")
+    doc = tmp_path / "notes.md"
+    doc.write_text("# Notes\n", encoding="utf-8")
+    transcript_dir = tmp_path / "graphify-out" / "transcripts"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "lecture.txt"
+    transcript.write_text("lecture transcript", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    corpus = {str(video), str(doc)}
+
+    fresh_output = {
+        "nodes": [{"id": "lecture", "source_file": str(transcript)}],
+        "edges": [],
+        "hyperedges": [],
+    }
+    # A stale map from an interrupted run must not hide an unrelated document.
+    mappings = {
+        str(video): str(transcript),
+        str(tmp_path / "old.mp3"): str(doc),
+    }
+    dispatched_media = {str(video)}
+    current_mappings = {
+        media_path: transcript_path
+        for media_path, transcript_path in mappings.items()
+        if media_path in dispatched_media
+    }
+    transcript_paths = set(current_mappings.values())
+    assert str(doc) not in transcript_paths
+    assert [str(doc)] == [path for path in [str(doc)] if path not in transcript_paths]
+    raw_corpus = {"document": [str(doc)], "video": [str(video)]}
+    manifest_corpus = {
+        **raw_corpus,
+        "document": [
+            *raw_corpus["document"],
+            *[
+                transcript_path for transcript_path in current_mappings.values()
+                if transcript_path not in raw_corpus["document"]
+            ],
+        ],
+    }
+    stamped = _stamped_manifest_files(manifest_corpus, fresh_output, tmp_path)["document"]
+    assert stamped == [str(transcript)]
+
+    media_files = {
+        "video": [
+            media_path for media_path in dispatched_media
+            if current_mappings.get(media_path) in set(stamped)
+        ]
+    }
+    assert media_files == {"video": [str(video)]}
+    save_manifest(
+        {"document": [str(doc)], **media_files}, manifest_path, kind="semantic",
+        root=tmp_path, scan_corpus=corpus,
+    )
+    assert detect_incremental(tmp_path, manifest_path, kind="auto")["new_total"] == 0
+
+    # A first-run media file with no transcript mapping remains queued.
+    failed_first_run = tmp_path / "failed-first-run.mp3"
+    failed_first_run.write_bytes(b"untranscribed")
+    corpus.add(str(failed_first_run))
+    first_failure = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert [Path(f).name for f in first_failure["new_files"]["video"]] == [
+        "failed-first-run.mp3"
+    ]
+
+    # Modified media is warm again only after a mapped transcript has fresh output.
+    video.write_bytes(b"changed audio")
+    changed = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert "lecture.mp3" in {Path(f).name for f in changed["new_files"]["video"]}
+    save_manifest(
+        media_files, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus,
+    )
+    recovered = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert "lecture.mp3" not in {Path(f).name for f in recovered["new_files"]["video"]}
+
+    video.write_bytes(b"changed audio again")
+    save_manifest(
+        {"video": []}, manifest_path, kind="semantic", root=tmp_path,
+        scan_corpus=corpus, clear_semantic={str(video)},
+    )
+    failed_semantic = detect_incremental(tmp_path, manifest_path, kind="auto")
+    assert "lecture.mp3" in {Path(f).name for f in failed_semantic["new_files"]["video"]}
+
+
 def test_save_manifest_clear_ast_blanks_both_hashes_for_failed_extra(tmp_path):
     """#2543: AST failure (missing optional extra) must blank both hashes so
     the next extract re-queues the file without deleting graphify-out/."""

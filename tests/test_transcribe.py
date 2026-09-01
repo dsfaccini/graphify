@@ -472,7 +472,7 @@ def test_transcribe_uses_cache(tmp_path):
     video.write_bytes(b"fake")
     out_dir = tmp_path / "transcripts"
     out_dir.mkdir()
-    cached = out_dir / "lecture.txt"
+    cached = transcribe_module._transcript_cache_path(video, video, out_dir)
     cached.write_text("Cached transcript content.")
 
     result = transcribe(video, output_dir=out_dir)
@@ -485,7 +485,7 @@ def test_transcribe_force_reruns(tmp_path):
     video.write_bytes(b"fake")
     out_dir = tmp_path / "transcripts"
     out_dir.mkdir()
-    (out_dir / "talk.txt").write_text("Old transcript.")
+    transcribe_module._transcript_cache_path(video, video, out_dir).write_text("Old transcript.")
 
     fake_segment = MagicMock()
     fake_segment.text = "New transcript segment."
@@ -526,7 +526,7 @@ def test_transcribe_all_uses_cache(tmp_path):
     video.write_bytes(b"fake")
     out_dir = tmp_path / "transcripts"
     out_dir.mkdir()
-    cached = out_dir / "lecture.txt"
+    cached = transcribe_module._transcript_cache_path(video, video, out_dir)
     cached.write_text("Cached.")
 
     results = transcribe_all([str(video)], output_dir=out_dir)
@@ -546,3 +546,94 @@ def test_transcribe_all_skips_failed(tmp_path):
         results = transcribe_all([str(video)], output_dir=tmp_path / "out")
 
     assert results == []
+
+
+def test_transcribe_uses_distinct_stable_cache_paths_for_same_stem_sources(tmp_path):
+    """Distinct media paths with the same name never share a transcript cache."""
+    first = tmp_path / "one" / "lecture.mp4"
+    second = tmp_path / "two" / "lecture.mp4"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    out_dir = tmp_path / "transcripts"
+
+    fake_segment = MagicMock()
+    fake_segment.text = "Transcript."
+    fake_info = MagicMock()
+    fake_info.language = "en"
+    fake_model = MagicMock()
+    fake_model.transcribe.return_value = ([fake_segment], fake_info)
+
+    with patch("graphify.transcribe._get_whisper", return_value=lambda *a, **kw: fake_model):
+        first_result = transcribe(first, output_dir=out_dir)
+        second_result = transcribe(second, output_dir=out_dir)
+
+    assert first_result.parent == out_dir
+    assert second_result.parent == out_dir
+    assert first_result != second_result
+    assert first_result.name.startswith("lecture-")
+    assert second_result.name.startswith("lecture-")
+    assert transcribe(first, output_dir=out_dir) == first_result
+    assert transcribe(second, output_dir=out_dir) == second_result
+    assert fake_model.transcribe.call_count == 2
+
+
+def test_transcript_cache_path_keys_urls_by_original_url(tmp_path):
+    """URL transcripts use the original URL identity, not a downloaded file name."""
+    out_dir = tmp_path / "transcripts"
+    audio_path = out_dir / "downloads" / "yt_shared.m4a"
+    first = transcribe_module._transcript_cache_path(
+        "https://example.com/watch?v=one", audio_path, out_dir,
+    )
+    second = transcribe_module._transcript_cache_path(
+        "https://example.com/watch?v=two", audio_path, out_dir,
+    )
+
+    assert first.parent == out_dir
+    assert second.parent == out_dir
+    assert first != second
+    assert transcribe_module._transcript_cache_path(
+        "https://example.com/watch?v=one", audio_path, out_dir,
+    ) == first
+
+
+def test_transcribe_ignores_ambiguous_legacy_stem_cache(tmp_path):
+    """A stem-only legacy cache cannot prove source identity and is not reused."""
+    video = tmp_path / "lecture.mp4"
+    video.write_bytes(b"fake")
+    out_dir = tmp_path / "transcripts"
+    out_dir.mkdir()
+    legacy = out_dir / "lecture.txt"
+    legacy.write_text("Ambiguous legacy transcript.")
+
+    fake_segment = MagicMock()
+    fake_segment.text = "Fresh transcript."
+    fake_info = MagicMock()
+    fake_info.language = "en"
+    fake_model = MagicMock()
+    fake_model.transcribe.return_value = ([fake_segment], fake_info)
+
+    with patch("graphify.transcribe._get_whisper", return_value=lambda *a, **kw: fake_model):
+        result = transcribe(video, output_dir=out_dir)
+
+    assert result != legacy
+    assert result.read_text() == "Fresh transcript."
+    assert legacy.read_text() == "Ambiguous legacy transcript."
+    assert fake_model.transcribe.call_count == 1
+
+
+def test_transcribe_all_force_forwards_to_each_changed_media_file(tmp_path):
+    """Incremental callers can force a fresh transcript before manifest stamping."""
+    video = tmp_path / "lecture.mp4"
+    video.write_bytes(b"fake")
+    expected = tmp_path / "transcripts" / "lecture-fresh.txt"
+
+    with patch("graphify.transcribe.transcribe", return_value=expected) as mocked:
+        assert transcribe_all([str(video)], output_dir=expected.parent, force=True) == [
+            str(expected)
+        ]
+
+    mocked.assert_called_once_with(
+        str(video), expected.parent, initial_prompt=None, force=True,
+    )

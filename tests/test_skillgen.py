@@ -687,6 +687,79 @@ def test_generated_runbooks_pass_root_to_save_manifest():
     assert checked >= 4, f"expected save_manifest calls across the runbooks, found {checked}"
 
 
+def test_generated_runbooks_select_manifest_tiers_once_at_step_nine():
+    """Runbooks use auto detection and defer the single manifest stage to Step 9."""
+    platforms = gen.load_platforms()
+    artifacts = gen.render_all(platforms)
+    updates = [a for a in artifacts if a.path.endswith("/references/update.md")]
+    assert updates
+    for artifact in updates:
+        assert "detect_incremental(Path('INPUT_PATH'), kind='auto')" in artifact.content
+        assert ".graphify_incremental_fresh.json" in artifact.content
+        assert "save_manifest(" not in artifact.content
+
+    skill_paths = {platform.skill_dst for platform in platforms.values()}
+    full_builds = [a for a in artifacts if a.path in skill_paths]
+    assert full_builds
+    for artifact in full_builds:
+        assert "_code_files = {'code': _corpus.get('code', [])}" in artifact.content
+        assert "_fresh_output =" in artifact.content
+        assert "_media_to_transcript = {media_path: transcript_path" in artifact.content
+        assert "if media_path in _media_dispatched}" in artifact.content
+        assert "_manifest_corpus = {**_corpus" in artifact.content
+        assert "_semantic_manifest_files = {**_semantic_files, **_media_files}" in artifact.content
+        assert "save_manifest(_code_files, kind='ast'" in artifact.content
+        assert "save_manifest(_semantic_manifest_files, kind='semantic'" in artifact.content
+
+    transcribe_artifacts = [
+        artifact for artifact in artifacts
+        if artifact.path.endswith("/references/transcribe.md")
+        or "from graphify.transcribe import transcribe_all" in artifact.content
+    ]
+    assert transcribe_artifacts
+    for artifact in transcribe_artifacts:
+        assert "media_to_transcript = {}" in artifact.content
+        assert "force = bool(detect.get('all_files'))" in artifact.content
+        assert "transcribe_all([media_path], initial_prompt=prompt, force=force)" in artifact.content
+        assert "documents = detect.setdefault('files', {}).setdefault('document', [])" in artifact.content
+
+
+def test_monolith_update_flows_use_changed_files_and_fresh_merge_contract():
+    """Aider/Devin update scripts keep changed work separate from raw corpus."""
+    platforms = gen.load_platforms()
+    paths = {
+        "aider": (
+            ".graphify_detect.json",
+            ".graphify_extract.json",
+            ".graphify_incremental.json",
+            ".graphify_incremental_fresh.json",
+        ),
+        "devin": (
+            "graphify-out/.graphify_detect.json",
+            "graphify-out/.graphify_extract.json",
+            "graphify-out/.graphify_incremental.json",
+            "graphify-out/.graphify_incremental_fresh.json",
+        ),
+    }
+    for platform_key, (detect_path, extract_path, incremental_path, fresh_path) in paths.items():
+        body = gen.render(platforms[platform_key])[0].content
+        update = body.split("## For --update (incremental re-extraction)", 1)[1]
+        update = update.split("## For --cluster-only", 1)[0]
+        assert f"Path('{detect_path}').write_text(json.dumps({{" in update
+        assert "'files': result.get('new_files', {})," in update
+        assert "'all_files': result.get('files', {})," in update
+        assert "run Step 2.5 when" in update
+        assert "force = bool(detect.get('all_files'))" in body
+        assert "transcribe_all([media_path], initial_prompt=prompt, force=force)" in body
+        assert f"Path('{fresh_path}').write_text(json.dumps(new_extraction" in update
+        assert f"Path('{incremental_path}').read_text()" in update
+        assert "G = build_merge(" in update
+        assert f"Path('{extract_path}').write_text(json.dumps(merged_out" in update
+        assert "G_existing.update(G_new)" not in update
+        step_nine = body.split("### Step 9 - Save manifest", 1)[1]
+        assert "_dispatched = {f for t, fl in detect['files'].items()" in step_nine
+
+
 def test_devin_keeps_its_multi_field_frontmatter():
     """devin renders inline, so its 4+-field frontmatter is preserved verbatim."""
     platforms = gen.load_platforms()

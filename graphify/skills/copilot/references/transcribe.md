@@ -36,19 +36,34 @@ from graphify.transcribe import transcribe_all
 detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding=\"utf-8\"))
 video_files = detect.get('files', {}).get('video', [])
 prompt = os.environ.get('GRAPHIFY_WHISPER_PROMPT', 'Use proper punctuation and paragraph breaks.')
+force = bool(detect.get('all_files'))
 
-transcript_paths = transcribe_all(video_files, initial_prompt=prompt)
-# Write the JSON from Python (NOT a shell '>' redirect): transcribe_all/Whisper
-# print progress to stdout, which would otherwise corrupt the JSON file (#1392).
-Path('graphify-out/.graphify_transcripts.json').write_text(json.dumps(transcript_paths, ensure_ascii=False), encoding=\"utf-8\")
-print(f'Transcribed {len(transcript_paths)} file(s)', file=sys.stderr)
+media_to_transcript = {}
+for media_path in video_files:
+    transcript_paths = transcribe_all([media_path], initial_prompt=prompt, force=force)
+    if transcript_paths:
+        media_to_transcript[media_path] = transcript_paths[0]
+
+# Preserve the original media key. In incremental runs force a fresh transcript
+# for each changed media source before Step 9 considers semantic output. Write
+# JSON from Python because Whisper progress on stdout would corrupt a shell
+# redirect (#1392).
+Path('graphify-out/.graphify_transcripts.json').write_text(
+    json.dumps(media_to_transcript, ensure_ascii=False), encoding=\"utf-8\"
+)
+documents = detect.setdefault('files', {}).setdefault('document', [])
+for transcript_path in media_to_transcript.values():
+    if transcript_path not in documents:
+        documents.append(transcript_path)
+Path('graphify-out/.graphify_detect.json').write_text(
+    json.dumps(detect, ensure_ascii=False), encoding=\"utf-8\"
+)
+print(f'Transcribed {len(media_to_transcript)} file(s)', file=sys.stderr)
 "
 ```
 
-After transcription:
-- Read the transcript paths from `graphify-out/.graphify_transcripts.json`
-- Add them to the docs list before dispatching semantic subagents in Step 3B
-- Print how many transcripts were created: `Transcribed N video file(s) -> treating as docs`
-- If transcription fails for a file, print a warning and continue with the rest
+After transcription, use the rewritten detect file for Step 3B. It contains only
+successful transcripts in `files['document']` and retains original media in
+`files['video']` for Step 9.
 
 **Whisper model:** Default is `base`. If the user passed `--whisper-model <name>`, `export GRAPHIFY_WHISPER_MODEL=<name>` (it must be exported, not just assigned) before running the command above.
