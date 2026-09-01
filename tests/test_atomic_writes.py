@@ -120,6 +120,20 @@ def test_write_json_atomic_roundtrip(tmp_path):
     assert not any(name.name.endswith(".tmp") for name in tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_write_json_atomic_rejects_nonfinite_without_replacing_existing(tmp_path, value):
+    from graphify.paths import write_json_atomic
+
+    p = tmp_path / "graph.json"
+    p.write_text('{"previous":true}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        write_json_atomic(p, {"value": value})
+
+    assert p.read_text(encoding="utf-8") == '{"previous":true}'
+    assert [item.name for item in tmp_path.iterdir()] == ["graph.json"]
+
+
 def test_to_json_writes_atomically_no_tmp_leftover(tmp_path):
     import networkx as nx
     from graphify.export import to_json

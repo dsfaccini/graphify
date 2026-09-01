@@ -9,8 +9,11 @@ import re
 import shutil
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+import ijson
+from ijson.common import JSONError
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label
@@ -221,6 +224,156 @@ def _git_head(cwd: "str | Path | None" = None) -> str | None:
 MALFORMED_GRAPH = object()
 
 
+@dataclass(frozen=True)
+class _ExistingGraphSummary:
+    """Counts retained from one stable, fully-validated graph.json scan."""
+
+    node_count: int
+    hyperedge_count: int | None
+
+
+class _ExistingGraphSummaryError(ValueError):
+    """A graph file could not be summarized safely for overwrite decisions."""
+
+
+_SUMMARY_TOPOLOGY_KEYS = frozenset({
+    "directed", "multigraph", "graph", "nodes", "links", "edges", "hyperedges",
+})
+_SUMMARY_ARRAY_KEYS = frozenset({"nodes", "links", "edges", "hyperedges"})
+
+
+def _graph_file_token(path: Path) -> tuple[int, int, int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+
+
+def _is_whitespace_only(path: Path) -> bool:
+    with path.open("rb") as handle:
+        while chunk := handle.read(65_536):
+            if not chunk.isspace():
+                return False
+    return True
+
+
+def _existing_graph_summary(path: Path) -> _ExistingGraphSummary | None:
+    """Count top-level graph arrays without retaining any records.
+
+    ``None`` is reserved for an empty or whitespace-only file, which has no
+    graph content to protect. All other malformed, unreadable, or unstable
+    inputs raise so overwrite callers can fail closed.
+    """
+    try:
+        token = _graph_file_token(path)
+    except OSError as exc:
+        raise _ExistingGraphSummaryError(f"cannot stat {path}: {exc}") from exc
+    if token[2] == 0:
+        try:
+            if _graph_file_token(path) != token:
+                raise _ExistingGraphSummaryError(f"{path} changed while being summarized")
+        except OSError as exc:
+            raise _ExistingGraphSummaryError(
+                f"cannot restat {path} after scanning: {exc}"
+            ) from exc
+        return None
+
+    root_started = False
+    root_finished = False
+    saw_event = False
+    nodes_seen = False
+    hyperedges_seen = False
+    seen_topology_keys: set[str] = set()
+    node_count = 0
+    hyperedge_count = 0
+    scan_error: Exception | None = None
+    try:
+        with path.open("rb") as handle:
+            for prefix, event, value in ijson.parse(handle, use_float=False):
+                saw_event = True
+                if prefix == "":
+                    if event == "start_map":
+                        if root_started:
+                            raise _ExistingGraphSummaryError(
+                                f"{path} must contain one top-level JSON object"
+                            )
+                        root_started = True
+                    elif event == "end_map":
+                        if not root_started or root_finished:
+                            raise _ExistingGraphSummaryError(
+                                f"{path} must contain one complete top-level JSON object"
+                            )
+                        root_finished = True
+                    elif event == "map_key":
+                        if not root_started or root_finished:
+                            raise _ExistingGraphSummaryError(
+                                f"{path} has an invalid top-level JSON object"
+                            )
+                        if value in _SUMMARY_TOPOLOGY_KEYS:
+                            if value in seen_topology_keys:
+                                raise _ExistingGraphSummaryError(
+                                    f"{path} repeats top-level {value!r}"
+                                )
+                            seen_topology_keys.add(value)
+                    else:
+                        raise _ExistingGraphSummaryError(
+                            f"{path} must contain a top-level JSON object"
+                        )
+
+                if prefix in _SUMMARY_ARRAY_KEYS:
+                    if event == "start_array":
+                        if prefix == "nodes" and nodes_seen:
+                            raise _ExistingGraphSummaryError(
+                                f"{path} repeats top-level 'nodes'"
+                            )
+                        if prefix == "nodes":
+                            nodes_seen = True
+                        elif prefix == "hyperedges":
+                            hyperedges_seen = True
+                    elif event != "end_array":
+                        raise _ExistingGraphSummaryError(
+                            f"{path} top-level {prefix!r} must be an array"
+                        )
+                elif prefix == "nodes.item" and event in {
+                    "start_map", "start_array", "null", "boolean", "number", "string",
+                }:
+                    node_count += 1
+                elif prefix == "hyperedges.item" and event in {
+                    "start_map", "start_array", "null", "boolean", "number", "string",
+                }:
+                    hyperedge_count += 1
+    except (_ExistingGraphSummaryError, JSONError, OSError, UnicodeError) as exc:
+        scan_error = exc
+
+    try:
+        current = _graph_file_token(path)
+    except OSError as exc:
+        raise _ExistingGraphSummaryError(f"cannot restat {path} after scanning: {exc}") from exc
+    if current != token:
+        raise _ExistingGraphSummaryError(f"{path} changed while being summarized")
+    if scan_error is not None:
+        if not saw_event:
+            try:
+                whitespace_only = _is_whitespace_only(path)
+                if _graph_file_token(path) != token:
+                    raise _ExistingGraphSummaryError(f"{path} changed while being summarized")
+            except OSError as exc:
+                raise _ExistingGraphSummaryError(
+                    f"cannot restat {path} after scanning: {exc}"
+                ) from exc
+            if whitespace_only:
+                return None
+        raise _ExistingGraphSummaryError(f"cannot parse {path}: {scan_error}") from scan_error
+    if not saw_event:
+        return None
+    if not root_started or not root_finished:
+        raise _ExistingGraphSummaryError(f"{path} is not a complete top-level JSON object")
+    if not nodes_seen:
+        raise _ExistingGraphSummaryError(f"{path} is missing top-level 'nodes' array")
+    return _ExistingGraphSummary(
+        node_count=node_count,
+        hyperedge_count=hyperedge_count if hyperedges_seen else None,
+    )
+
+
 def existing_graph_node_count(path: "str | Path"):
     """Node count of an existing graph.json.
 
@@ -246,21 +399,10 @@ def existing_graph_node_count(path: "str | Path"):
         # Oversized: reading it to compare would be the DoS the cap guards against.
         return None
     try:
-        raw = p.read_text(encoding="utf-8")
-    except Exception:
-        # Present but unreadable: fail closed if it has bytes, else nothing to lose.
-        try:
-            return MALFORMED_GRAPH if p.stat().st_size > 0 else None
-        except Exception:
-            return None
-    if not raw.strip():
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
+        summary = _existing_graph_summary(p)
+    except _ExistingGraphSummaryError:
         return MALFORMED_GRAPH
-    nodes = data.get("nodes") if isinstance(data, dict) else None
-    return len(nodes) if isinstance(nodes, list) else MALFORMED_GRAPH
+    return None if summary is None else summary.node_count
 
 
 def _graph_json_data(
@@ -332,6 +474,8 @@ def _graph_json_data(
 def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
+    existing_summary: _ExistingGraphSummary | None = None
+    summary_attempted = False
     if not force and existing_path.exists():
         from graphify.security import check_graph_file_size_cap
         try:
@@ -345,32 +489,23 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
             oversized = False
         if not oversized:
             try:
-                raw = existing_path.read_text(encoding="utf-8")
-            except Exception:
-                raw = ""
-            if not raw.strip():
+                existing_summary = _existing_graph_summary(existing_path)
+                summary_attempted = True
+            except _ExistingGraphSummaryError as exc:
+                import sys as _sys
+                print(
+                    f"[graphify] WARNING: existing {existing_path} could not be "
+                    f"read to verify the new graph is not smaller ({exc}). "
+                    f"Refusing to overwrite; pass force=True to override.",
+                    file=_sys.stderr,
+                )
+                return False
+            if existing_summary is None:
                 # Empty/whitespace existing file (e.g. a freshly touched path):
                 # no nodes to lose, so any new graph is a growth — proceed.
                 existing_n = 0
             else:
-                try:
-                    existing_data = json.loads(raw)
-                    existing_n = len(existing_data.get("nodes", []))
-                except Exception as exc:
-                    # Non-empty but unparseable existing graph (corrupt or a
-                    # mid-write): we cannot verify the new graph is not a silent
-                    # shrink. Fail SAFE — refuse rather than overwrite. A
-                    # fail-OPEN here (the prior behavior) is the silent data-loss
-                    # path #479 exists to prevent: a transiently unreadable
-                    # graph.json would let a partial rebuild clobber a good one.
-                    import sys as _sys
-                    print(
-                        f"[graphify] WARNING: existing {existing_path} could not be "
-                        f"read to verify the new graph is not smaller ({exc}). "
-                        f"Refusing to overwrite; pass force=True to override.",
-                        file=_sys.stderr,
-                    )
-                    return False
+                existing_n = existing_summary.node_count
             new_n = G.number_of_nodes()
             if new_n < existing_n:
                 import sys as _sys
@@ -396,20 +531,25 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         # the graph's truth rather than preserving the stale set — resurrecting
         # hyperedges whose members may no longer exist would reintroduce the
         # dangling-member shape #1916 removed.
-        _prev_hyperedges = None
-        try:
-            if existing_path.exists():
+        previous_hyperedge_count = None
+        if summary_attempted:
+            previous_hyperedge_count = (
+                None if existing_summary is None else existing_summary.hyperedge_count
+            )
+        elif existing_path.exists():
+            try:
                 from graphify.security import check_graph_file_size_cap
                 check_graph_file_size_cap(existing_path)
-                _prev = json.loads(existing_path.read_text(encoding="utf-8"))
-                if isinstance(_prev, dict):
-                    _prev_hyperedges = _prev.get("hyperedges")
-        except Exception:
-            _prev_hyperedges = None
-        if _prev_hyperedges:
+                summary = _existing_graph_summary(existing_path)
+                previous_hyperedge_count = (
+                    None if summary is None else summary.hyperedge_count
+                )
+            except Exception:
+                previous_hyperedge_count = None
+        if previous_hyperedge_count:
             print(
                 f"[graphify] WARNING: graph carries no hyperedge metadata but "
-                f"{existing_path} already holds {len(_prev_hyperedges)} "
+                f"{existing_path} already holds {previous_hyperedge_count} "
                 f"hyperedge(s); writing an empty set. Rebuild from the original "
                 f"extraction if this is unexpected.",
                 file=sys.stderr,

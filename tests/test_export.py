@@ -1070,6 +1070,8 @@ def test_existing_graph_node_count(tmp_path):
     assert existing_graph_node_count(p) is None            # absent -> nothing to protect
     p.write_text("", encoding="utf-8")
     assert existing_graph_node_count(p) is None            # empty -> nothing to protect
+    p.write_text("\n\t ", encoding="utf-8")
+    assert existing_graph_node_count(p) is None            # whitespace -> nothing to protect
     # Non-empty but unparseable must fail CLOSED (sentinel), matching to_json's
     # #479 guard — a corrupt/mid-write file could be hiding a complete graph.
     p.write_text("{not json", encoding="utf-8")
@@ -1078,6 +1080,200 @@ def test_existing_graph_node_count(tmp_path):
     assert existing_graph_node_count(p) is MALFORMED_GRAPH  # structurally wrong -> fail closed
     p.write_text('{"nodes": [{"id": "a"}, {"id": "b"}], "links": []}', encoding="utf-8")
     assert existing_graph_node_count(p) == 2               # valid
+
+
+def test_existing_graph_summary_streams_only_top_level_arrays(tmp_path, monkeypatch):
+    """Node and hyperedge counts need bounded reads, not decoded record lists."""
+    import graphify.export as export_mod
+
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps({
+        "nodes": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        "hyperedges": [{"id": "h1"}, {"id": "h2"}],
+        "metadata": {
+            "nodes": [{"id": "nested"}],
+            "hyperedges": [{"id": "nested-hyperedge"}],
+        },
+    }), encoding="utf-8")
+    reads: list[int] = []
+    real_open = Path.open
+    real_read_text = Path.read_text
+
+    class BoundedReader:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def read(self, size=-1):
+            assert size != -1, "summary must not request an unbounded full-file read"
+            assert size <= 65_536
+            reads.append(size)
+            return self.handle.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.handle.close()
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def bounded_open(self, mode="r", *args, **kwargs):
+        handle = real_open(self, mode, *args, **kwargs)
+        if self == p and mode == "rb":
+            return BoundedReader(handle)
+        return handle
+
+    def no_full_decode(*args, **kwargs):
+        raise AssertionError("summary must not materialize graph JSON with json.loads")
+
+    def no_text_read(self, *args, **kwargs):
+        if self == p:
+            raise AssertionError("summary must not call Path.read_text")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", bounded_open)
+    monkeypatch.setattr(Path, "read_text", no_text_read)
+    monkeypatch.setattr(export_mod.json, "loads", no_full_decode)
+
+    summary = export_mod._existing_graph_summary(p)
+    assert summary is not None
+    assert summary.node_count == 3
+    assert summary.hyperedge_count == 2
+    assert reads
+
+
+def test_existing_graph_summary_requires_top_level_array_fields(tmp_path):
+    from graphify.export import MALFORMED_GRAPH, existing_graph_node_count
+
+    p = tmp_path / "graph.json"
+    p.write_text('{"metadata":{"nodes":[]},"links":[]}', encoding="utf-8")
+    assert existing_graph_node_count(p) is MALFORMED_GRAPH
+    p.write_text('{"nodes":[],"hyperedges":{"items":[]}}', encoding="utf-8")
+    assert existing_graph_node_count(p) is MALFORMED_GRAPH
+
+
+def test_existing_graph_summary_rejects_malformed_or_duplicate_topology_fields(tmp_path):
+    """Only one well-formed instance of each node-link topology field is safe."""
+    from graphify.export import MALFORMED_GRAPH, existing_graph_node_count
+
+    p = tmp_path / "graph.json"
+    malformed_or_duplicate = (
+        '{"nodes":[],"links":{}}',
+        '{"nodes":[],"edges":null}',
+        '{"nodes":[],"nodes":[]}',
+        '{"nodes":[],"links":[],"links":[]}',
+        '{"nodes":[],"edges":[],"edges":[]}',
+        '{"nodes":[],"hyperedges":[],"hyperedges":[]}',
+        '{"nodes":[],"directed":false,"directed":false}',
+        '{"nodes":[],"multigraph":false,"multigraph":false}',
+        '{"nodes":[],"graph":{},"graph":{}}',
+    )
+    for content in malformed_or_duplicate:
+        p.write_text(content, encoding="utf-8")
+        assert existing_graph_node_count(p) is MALFORMED_GRAPH
+
+
+def test_to_json_rejects_nonfinite_data_without_replacing_existing(tmp_path):
+    import networkx as nx
+    import pytest
+
+    p = tmp_path / "graph.json"
+    original = '{"nodes":[{"id":"old"}],"links":[]}'
+    p.write_text(original, encoding="utf-8")
+    graph = nx.Graph()
+    graph.add_node("new", label="new", score=math.nan)
+    graph.graph["hyperedges"] = []
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        to_json(graph, {0: ["new"]}, str(p), force=True)
+
+    assert p.read_text(encoding="utf-8") == original
+    assert not any(item.name.endswith(".tmp") for item in tmp_path.iterdir())
+
+
+def test_existing_graph_summary_skips_oversized_files(tmp_path, monkeypatch):
+    import graphify.export as export_mod
+
+    p = tmp_path / "graph.json"
+    p.write_text('{"nodes":[{"id":"old"}],"links":[]}', encoding="utf-8")
+    monkeypatch.setenv("GRAPHIFY_MAX_GRAPH_BYTES", "1")
+
+    def unexpected_summary(path):
+        raise AssertionError("oversized graph must not be scanned")
+
+    monkeypatch.setattr(export_mod, "_existing_graph_summary", unexpected_summary)
+    assert export_mod.existing_graph_node_count(p) is None
+    assert export_mod.to_json(_mkG(2), {}, str(p), force=False) is True
+
+
+def test_to_json_reuses_one_summary_for_shrink_and_hyperedge_warning(tmp_path, monkeypatch, capsys):
+    """Missing fresh hyperedges use the shrink scan instead of decoding again."""
+    import graphify.export as export_mod
+
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps({
+        "nodes": [{"id": f"n{index}"} for index in range(3)],
+        "hyperedges": [{"id": "h1"}, {"id": "h2"}],
+    }), encoding="utf-8")
+    calls: list[Path] = []
+    real_summary = export_mod._existing_graph_summary
+
+    def count_summary(path):
+        calls.append(Path(path))
+        return real_summary(path)
+
+    monkeypatch.setattr(export_mod, "_existing_graph_summary", count_summary)
+    assert to_json(_mkG(3), {}, str(p), force=False) is True
+    assert calls == [p]
+    assert "already holds 2 hyperedge(s)" in capsys.readouterr().err
+
+
+def test_to_json_refuses_truncated_or_replaced_existing_graph(tmp_path, monkeypatch, capsys):
+    import graphify.export as export_mod
+
+    p = tmp_path / "graph.json"
+    p.write_text('{"nodes":[', encoding="utf-8")
+    assert to_json(_mkG(3), {}, str(p), force=False) is False
+    assert "Refusing to overwrite" in capsys.readouterr().err
+
+    p.write_text('{"nodes":[{"id":"old"}],"links":[]}', encoding="utf-8")
+    replacement = '{"nodes":[{"id":"external"}],"links":[]}'
+    real_parse = export_mod.ijson.parse
+    replaced = False
+
+    def replace_during_parse(*args, **kwargs):
+        nonlocal replaced
+        for event in real_parse(*args, **kwargs):
+            yield event
+            if not replaced:
+                p.write_text(replacement, encoding="utf-8")
+                replaced = True
+
+    monkeypatch.setattr(export_mod.ijson, "parse", replace_during_parse)
+    assert to_json(_mkG(3), {}, str(p), force=False) is False
+    assert p.read_text(encoding="utf-8") == replacement
+    assert "changed while being summarized" in capsys.readouterr().err
+
+
+def test_to_json_force_bypasses_unreadable_summary(tmp_path, monkeypatch):
+    """Force still bypasses the shrink guard when the prior graph cannot be read."""
+    p = tmp_path / "graph.json"
+    original = '{"nodes":[{"id":"old"}],"links":[]}'
+    p.write_text(original, encoding="utf-8")
+    real_open = Path.open
+
+    def unreadable_open(self, mode="r", *args, **kwargs):
+        if self == p and mode == "rb":
+            raise OSError("denied")
+        return real_open(self, mode, *args, **kwargs)
+
+    graph = _mkG(2)
+    graph.graph["hyperedges"] = []
+    monkeypatch.setattr(Path, "open", unreadable_open)
+    assert to_json(graph, {}, str(p), force=False) is False
+    assert p.read_text(encoding="utf-8") == original
+    assert to_json(graph, {}, str(p), force=True) is True
 
 
 def test_hyperedge_perimeter_uses_convex_hull_not_member_order():
