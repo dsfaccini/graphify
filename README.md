@@ -368,8 +368,10 @@ gws auth login -s drive
 graphify extract ./docs --google-workspace
 ```
 
-You can also set `GRAPHIFY_GOOGLE_WORKSPACE=1`. Graphify exports shortcuts into
-`graphify-out/converted/` as Markdown sidecars, then extracts those files.
+You can also set `GRAPHIFY_GOOGLE_WORKSPACE=1` for an explicit `graphify extract`
+invocation. Graphify exports shortcuts into `graphify-out/converted/` as Markdown
+sidecars, then extracts those files. Automatic update, watch, and Git-hook rebuilds
+never export Google Workspace shortcuts.
 
 ---
 
@@ -546,7 +548,7 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `GRAPHIFY_MAX_RETRIES` | How many times to retry a rate-limited (429) request before giving up (default: 6; honors `Retry-After`) | optional — raise for strict per-org limits (e.g. kimi); `0` disables |
 | `GRAPHIFY_MAX_RETRY_DEPTH` | How deep a truncated chunk may be bisected and re-extracted (default: 3, so up to 8x sub-calls for one chunk) | optional — lower it to cap worst-case spend; `0` disables every retry (no bisection, no hollow-response retry), so a chunk costs exactly one call |
 | `GRAPHIFY_FORCE` | Force graph rebuild even with fewer nodes | optional — also `--force` flag |
-| `GRAPHIFY_GOOGLE_WORKSPACE` | Auto-enable Google Workspace export | optional — set to `1` |
+| `GRAPHIFY_GOOGLE_WORKSPACE` | Enable Google Workspace export for `graphify extract` | optional — set to `1` |
 | `GRAPHIFY_TRIAGE_BACKEND` | Backend for `graphify prs --triage` | optional — auto-detected from available keys |
 | `GRAPHIFY_TRIAGE_MODEL` | Model override for triage | optional — e.g. `claude-opus-4-7` |
 | `GRAPHIFY_QUERY_LOG_ENABLE` | Set to `1` to turn on the local query log at `~/.cache/graphify-queries.log` (records each query/path/explain question + corpus path). Off by default — nothing is written unless you opt in (#1797) | optional |

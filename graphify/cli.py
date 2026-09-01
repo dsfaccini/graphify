@@ -3335,6 +3335,8 @@ def dispatch_command(cmd: str) -> None:
             os.environ["GRAPHIFY_API_TIMEOUT"] = str(cli_api_timeout)
         if cli_max_workers is not None:
             os.environ["GRAPHIFY_MAX_WORKERS"] = str(cli_max_workers)
+        from graphify.google_workspace import google_workspace_enabled
+        google_workspace = google_workspace or google_workspace_enabled()
 
         # Resolve output dir. The user-facing contract is "<out>/graphify-out/"
         # so a fresh checkout writes graphify-out/ at the project root, matching
@@ -3426,7 +3428,7 @@ def dispatch_command(cmd: str) -> None:
             detection = _detect_incremental(
                 target,
                 manifest_path=str(manifest_path),
-                google_workspace=google_workspace or None,
+                google_workspace=google_workspace,
                 extra_excludes=_effective_excludes or None,
                 gitignore=_effective_gitignore,
             )
@@ -3499,7 +3501,7 @@ def dispatch_command(cmd: str) -> None:
             print(f"[graphify extract] scanning {target}")
             detection = _detect(
                 target,
-                google_workspace=google_workspace or None,
+                google_workspace=google_workspace,
                 extra_excludes=_effective_excludes or None,
                 cache_root=out_root,
                 gitignore=_effective_gitignore,

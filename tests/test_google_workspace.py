@@ -1,6 +1,9 @@
 from pathlib import Path
 import json
 
+import pytest
+
+import graphify.__main__ as mainmod
 import graphify.google_workspace as gw
 
 
@@ -44,7 +47,9 @@ def test_convert_gdoc_to_markdown_sidecar(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw, "_run_gws_export", fake_export)
 
-    out = gw.convert_google_workspace_file(shortcut, tmp_path / "converted")
+    out = gw.convert_google_workspace_file(
+        shortcut, tmp_path / "converted", allow_export=True,
+    )
 
     assert out is not None
     assert out.suffix == ".md"
@@ -67,6 +72,7 @@ def test_convert_gsheet_uses_xlsx_markdown_callback(tmp_path, monkeypatch):
     out = gw.convert_google_workspace_file(
         shortcut,
         tmp_path / "converted",
+        allow_export=True,
         xlsx_to_markdown=lambda path: "## Sheet: Main\n\n| A |\n| --- |\n| 1 |",
     )
 
@@ -127,3 +133,49 @@ def test_google_workspace_enabled_env(monkeypatch):
 
     monkeypatch.setenv("GRAPHIFY_GOOGLE_WORKSPACE", "0")
     assert not gw.google_workspace_enabled()
+
+
+def test_convert_google_workspace_file_requires_explicit_opt_in(tmp_path, monkeypatch):
+    shortcut = tmp_path / "Planning.gdoc"
+    shortcut.write_text('{"doc_id":"doc-123"}', encoding="utf-8")
+
+    def fail_if_read(path):
+        raise AssertionError(f"unapproved shortcut was read: {path}")
+
+    monkeypatch.setattr(gw, "read_google_shortcut", fail_if_read)
+
+    with pytest.raises(PermissionError, match="explicit opt-in"):
+        gw.convert_google_workspace_file(shortcut, tmp_path / "converted")
+
+
+@pytest.mark.parametrize("opt_in", ("flag", "env"))
+def test_extract_cli_grants_google_workspace_capability(tmp_path, monkeypatch, opt_in):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    (project / "Planning.gdoc").write_text('{"doc_id":"doc-123"}', encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_convert(path, out_dir, *, allow_export=False, xlsx_to_markdown=None, root=None):
+        calls.append(allow_export)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        converted = out_dir / "planning.md"
+        converted.write_text("# Planning\n", encoding="utf-8")
+        return converted
+
+    monkeypatch.setattr("graphify.detect.convert_google_workspace_file", fake_convert)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.delenv("GRAPHIFY_GOOGLE_WORKSPACE", raising=False)
+    argv = ["graphify", "extract", str(project), "--code-only", "--no-cluster"]
+    if opt_in == "flag":
+        argv.append("--google-workspace")
+    else:
+        monkeypatch.setenv("GRAPHIFY_GOOGLE_WORKSPACE", "1")
+    monkeypatch.setattr(mainmod.sys, "argv", argv)
+
+    try:
+        mainmod.main()
+    except SystemExit as exc:
+        assert exc.code in (None, 0)
+
+    assert calls == [True]

@@ -17,7 +17,6 @@ from typing import Callable
 from graphify.google_workspace import (
     GOOGLE_WORKSPACE_EXTENSIONS,
     convert_google_workspace_file,
-    google_workspace_enabled,
 )
 from graphify.paths import GRAPHIFY_OUT, out_path
 
@@ -1672,7 +1671,7 @@ def _resolves_under_root(path: Path, root: Path) -> bool:
     return True
 
 
-def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = True) -> dict:
+def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool = False, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = True) -> dict:
     root = root.resolve()
     configured_out_dir = root / GRAPHIFY_OUT
     configured_out_names = {configured_out_dir.name}
@@ -1696,7 +1695,6 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         )
     if follow_symlinks is None:
         follow_symlinks = False
-    google_workspace = google_workspace_enabled() if google_workspace is None else google_workspace
     files: dict[FileType, list[str]] = {
         FileType.CODE: [],
         FileType.DOCUMENT: [],
@@ -1906,12 +1904,17 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                 if not google_workspace:
                     skipped_sensitive.append(
                         str(p)
-                        + " [Google Workspace shortcut skipped - pass --google-workspace "
-                        "or set GRAPHIFY_GOOGLE_WORKSPACE=1]"
+                        + " [Google Workspace shortcut skipped - explicit export required]"
                     )
                     continue
                 try:
-                    md_path = convert_google_workspace_file(p, converted_dir, xlsx_to_markdown=xlsx_to_markdown, root=root)
+                    md_path = convert_google_workspace_file(
+                        p,
+                        converted_dir,
+                        allow_export=True,
+                        xlsx_to_markdown=xlsx_to_markdown,
+                        root=root,
+                    )
                 except Exception as exc:
                     skipped_sensitive.append(str(p) + f" [Google Workspace export failed: {exc}]")
                     continue
@@ -2378,7 +2381,7 @@ def detect_incremental(
     manifest_path: str = _MANIFEST_PATH,
     *,
     follow_symlinks: bool | None = None,
-    google_workspace: bool | None = None,
+    google_workspace: bool = False,
     kind: str = "semantic",
     extra_excludes: list[str] | None = None,
     gitignore: bool = True,

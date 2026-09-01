@@ -890,11 +890,30 @@ def test_detect_skips_google_workspace_shortcuts_by_default(tmp_path):
     assert any("Google Workspace shortcut skipped" in item for item in result["skipped_sensitive"])
 
 
+def test_detect_does_not_grant_google_workspace_from_environment(tmp_path, monkeypatch):
+    shortcut = tmp_path / "notes.gdoc"
+    shortcut.write_text('{"doc_id":"doc-1"}', encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_convert(path, out_dir, *, allow_export=False, xlsx_to_markdown=None, root=None):
+        calls.append(allow_export)
+        return None
+
+    monkeypatch.setenv("GRAPHIFY_GOOGLE_WORKSPACE", "1")
+    monkeypatch.setattr("graphify.detect.convert_google_workspace_file", fake_convert)
+
+    result = detect(tmp_path)
+
+    assert calls == []
+    assert any("Google Workspace shortcut skipped" in item for item in result["skipped_sensitive"])
+
+
 def test_detect_converts_google_workspace_shortcuts_when_enabled(tmp_path, monkeypatch):
     shortcut = tmp_path / "notes.gdoc"
     shortcut.write_text('{"doc_id":"doc-1"}', encoding="utf-8")
 
-    def fake_convert(path, out_dir, *, xlsx_to_markdown=None, root=None):
+    def fake_convert(path, out_dir, *, allow_export=False, xlsx_to_markdown=None, root=None):
+        assert allow_export is True
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / "notes_converted.md"
         out.write_text("# Notes\n\nA converted Google Doc.", encoding="utf-8")

@@ -39,6 +39,22 @@ def test_notify_only_idempotent(tmp_path):
     assert flag.read_text() == "1"
 
 
+def test_rebuild_does_not_export_google_workspace_shortcuts_from_environment(tmp_path, monkeypatch):
+    (tmp_path / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "Planning.gdoc").write_text('{"doc_id":"doc-123"}', encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_convert(path, out_dir, *, allow_export=False, xlsx_to_markdown=None, root=None):
+        calls.append(allow_export)
+        return None
+
+    monkeypatch.setenv("GRAPHIFY_GOOGLE_WORKSPACE", "1")
+    monkeypatch.setattr("graphify.detect.convert_google_workspace_file", fake_convert)
+
+    assert _rebuild_code(tmp_path, no_cluster=True, acquire_lock=False) is True
+    assert calls == []
+
+
 # --- _WATCHED_EXTENSIONS ---
 
 def test_watched_extensions_includes_code():

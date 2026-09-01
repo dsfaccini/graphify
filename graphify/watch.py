@@ -1414,6 +1414,7 @@ def _rebuild_code(
         _gitignore_enabled = _read_build_gitignore(out)
         detected = detect(
             watch_path, follow_symlinks=follow_symlinks,
+            google_workspace=False,
             extra_excludes=_persisted_excludes or None,
             gitignore=_gitignore_enabled,
         )

@@ -164,6 +164,7 @@ def convert_google_workspace_file(
     path: Path,
     out_dir: Path,
     *,
+    allow_export: bool = False,
     xlsx_to_markdown: Callable[[Path], str] | None = None,
     root: "Path | None" = None,
 ) -> Path | None:
@@ -175,6 +176,8 @@ def convert_google_workspace_file(
     ext = path.suffix.lower()
     if ext not in GOOGLE_WORKSPACE_EXTENSIONS:
         return None
+    if not allow_export:
+        raise PermissionError("Google Workspace export requires explicit opt-in")
 
     shortcut = read_google_shortcut(path)
     out_dir.mkdir(parents=True, exist_ok=True)
