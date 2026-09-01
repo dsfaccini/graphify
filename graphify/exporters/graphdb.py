@@ -1,9 +1,96 @@
 """graphdb — moved verbatim from graphify/export.py."""
 from __future__ import annotations
 
+from collections.abc import Hashable, Iterator, Mapping
 from graphify.analyze import _node_community_map
 import networkx as nx
 import re
+from typing import TypeVar
+
+
+_BATCH_SIZE = 500
+_MAX_OPEN_BATCHES = 64
+
+_BatchShape = TypeVar("_BatchShape", bound=Hashable)
+_BatchRow = TypeVar("_BatchRow")
+
+
+def _safe_rel(relation: object) -> str:
+    sanitized = re.sub(r"[^A-Z0-9_]", "_", str(relation).upper().replace(" ", "_").replace("-", "_"))
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"_{sanitized}"
+    return sanitized or "RELATED_TO"
+
+
+def _safe_label(label: object) -> str:
+    """Sanitize a graph-database node label to prevent Cypher injection."""
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "", str(label))
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"_{sanitized}"
+    return sanitized if sanitized else "Entity"
+
+
+def _scalar_props(data: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value for key, value in data.items()
+        if isinstance(value, (str, int, float, bool)) and not key.startswith("_")
+    }
+
+
+def _node_label(data: Mapping[str, object]) -> str:
+    return _safe_label(str(data.get("file_type", "Entity")).capitalize())
+
+
+def _append_to_batch(
+    batches: dict[_BatchShape, list[_BatchRow]],
+    shape: _BatchShape,
+    row: _BatchRow,
+) -> tuple[_BatchShape, list[_BatchRow]] | None:
+    flushed = None
+    if shape not in batches and len(batches) >= _MAX_OPEN_BATCHES:
+        oldest_shape = next(iter(batches))
+        flushed = oldest_shape, batches.pop(oldest_shape)
+
+    batch = batches.setdefault(shape, [])
+    batch.append(row)
+    if len(batch) == _BATCH_SIZE:
+        return shape, batches.pop(shape)
+    return flushed
+
+
+def _node_batches(
+    G: nx.Graph,
+    node_community: Mapping[object, object],
+) -> Iterator[tuple[str, list[dict[str, object]]]]:
+    batches: dict[str, list[dict[str, object]]] = {}
+    for node_id, data in G.nodes(data=True):
+        props = _scalar_props(data)
+        props["id"] = node_id
+        cid = node_community.get(node_id)
+        if cid is not None:
+            props["community"] = cid
+        flushed = _append_to_batch(batches, _node_label(data), props)
+        if flushed is not None:
+            yield flushed
+    yield from batches.items()
+
+
+def _edge_batches(
+    G: nx.Graph,
+) -> Iterator[tuple[tuple[str, str, str], list[dict[str, object]]]]:
+    batches: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for ordinal, (source, target, data) in enumerate(G.edges(data=True)):
+        shape = (_node_label(G.nodes[source]), _node_label(G.nodes[target]), _safe_rel(data.get("relation", "RELATED_TO")))
+        row = {
+            "src": source,
+            "tgt": target,
+            "props": _scalar_props(data),
+            "ordinal": ordinal,
+        }
+        flushed = _append_to_batch(batches, shape, row)
+        if flushed is not None:
+            yield flushed
+    yield from batches.items()
 
 
 def push_to_neo4j(
@@ -29,52 +116,31 @@ def push_to_neo4j(
 
     node_community = _node_community_map(communities) if communities else {}
 
-    def _safe_rel(relation: str) -> str:
-        return re.sub(r"[^A-Z0-9_]", "_", relation.upper().replace(" ", "_").replace("-", "_")) or "RELATED_TO"
-
-    def _safe_label(label: str) -> str:
-        """Sanitize a Neo4j node label to prevent Cypher injection."""
-        sanitized = re.sub(r"[^A-Za-z0-9_]", "", label)
-        return sanitized if sanitized else "Entity"
-
     driver = GraphDatabase.driver(uri, auth=(user, password))
     nodes_pushed = 0
     edges_pushed = 0
 
-    with driver.session() as session:
-        for node_id, data in G.nodes(data=True):
-            props = {
-                k: v for k, v in data.items()
-                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-            }
-            props["id"] = node_id
-            cid = node_community.get(node_id)
-            if cid is not None:
-                props["community"] = cid
-            ftype = _safe_label(data.get("file_type", "Entity").capitalize())
-            session.run(
-                f"MERGE (n:{ftype} {{id: $id}}) SET n += $props",
-                id=node_id,
-                props=props,
-            )
-            nodes_pushed += 1
+    try:
+        with driver.session() as session:
+            for label, rows in _node_batches(G, node_community):
+                session.run(
+                    f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row",
+                    rows=rows,
+                ).consume()
+                nodes_pushed += len(rows)
 
-        for u, v, data in G.edges(data=True):
-            rel = _safe_rel(data.get("relation", "RELATED_TO"))
-            props = {
-                k: v for k, v in data.items()
-                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-            }
-            session.run(
-                f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
-                f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
-                src=u,
-                tgt=v,
-                props=props,
-            )
-            edges_pushed += 1
+            for (source_label, target_label, relation), rows in _edge_batches(G):
+                session.run(
+                    f"UNWIND $rows AS row "
+                    f"WITH row ORDER BY row.ordinal "
+                    f"MATCH (a:{source_label} {{id: row.src}}), (b:{target_label} {{id: row.tgt}}) "
+                    f"MERGE (a)-[r:{relation}]->(b) SET r += row.props",
+                    rows=rows,
+                ).consume()
+                edges_pushed += len(rows)
+    finally:
+        driver.close()
 
-    driver.close()
     return {"nodes": nodes_pushed, "edges": edges_pushed}
 
 def push_to_falkordb(
@@ -116,14 +182,6 @@ def push_to_falkordb(
 
     node_community = _node_community_map(communities) if communities else {}
 
-    def _safe_rel(relation: str) -> str:
-        return re.sub(r"[^A-Z0-9_]", "_", relation.upper().replace(" ", "_").replace("-", "_")) or "RELATED_TO"
-
-    def _safe_label(label: str) -> str:
-        """Sanitize a FalkorDB node label to prevent Cypher injection."""
-        sanitized = re.sub(r"[^A-Za-z0-9_]", "", label)
-        return sanitized if sanitized else "Entity"
-
     parsed = urlparse(uri if "://" in uri else f"redis://{uri}")
     # FalkorDB auth is optional. Only send credentials when a password is
     # provided; otherwise connect anonymously and ignore any bolt-style default
@@ -141,33 +199,21 @@ def push_to_falkordb(
     nodes_pushed = 0
     edges_pushed = 0
 
-    for node_id, data in G.nodes(data=True):
-        props = {
-            k: v for k, v in data.items()
-            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-        }
-        props["id"] = node_id
-        cid = node_community.get(node_id)
-        if cid is not None:
-            props["community"] = cid
-        ftype = _safe_label(data.get("file_type", "Entity").capitalize())
+    for label, rows in _node_batches(G, node_community):
         graph.query(
-            f"MERGE (n:{ftype} {{id: $id}}) SET n += $props",
-            {"id": node_id, "props": props},
+            f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row",
+            {"rows": rows},
         )
-        nodes_pushed += 1
+        nodes_pushed += len(rows)
 
-    for u, v, data in G.edges(data=True):
-        rel = _safe_rel(data.get("relation", "RELATED_TO"))
-        props = {
-            k: v for k, v in data.items()
-            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-        }
+    for (source_label, target_label, relation), rows in _edge_batches(G):
         graph.query(
-            f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
-            f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
-            {"src": u, "tgt": v, "props": props},
+            f"UNWIND $rows AS row "
+            f"WITH row ORDER BY row.ordinal "
+            f"MATCH (a:{source_label} {{id: row.src}}), (b:{target_label} {{id: row.tgt}}) "
+            f"MERGE (a)-[r:{relation}]->(b) SET r += row.props",
+            {"rows": rows},
         )
-        edges_pushed += 1
+        edges_pushed += len(rows)
 
     return {"nodes": nodes_pushed, "edges": edges_pushed}
