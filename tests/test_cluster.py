@@ -21,6 +21,45 @@ def test_cluster_covers_all_nodes():
     all_nodes = {n for nodes in communities.values() for n in nodes}
     assert all_nodes == set(G.nodes)
 
+def test_cluster_partition_input_work_is_bounded_across_split_passes(monkeypatch):
+    """A primary partition plus both split passes must process at most 3x the graph."""
+    import graphify.cluster as cluster_module
+
+    G = nx.Graph()
+    for component in range(4):
+        nodes = [f"component-{component}-node-{index}" for index in range(50)]
+        G.add_nodes_from(nodes)
+        G.add_edges_from(zip(nodes, nodes[1:]))
+
+    partition_inputs: list[tuple[int, int]] = []
+
+    def partition(subgraph, resolution=1.0):
+        partition_inputs.append((subgraph.number_of_nodes(), subgraph.number_of_edges()))
+        if len(partition_inputs) == 1:
+            # Force a single oversized community, so cluster() re-partitions it.
+            return {node: 0 for node in subgraph}
+        if len(partition_inputs) == 2:
+            # Split that community into the four sparse components. Each has
+            # cohesion 49 / C(50, 2) < the threshold for the second pass.
+            return {
+                node: int(node.split("-", 2)[1])
+                for node in subgraph
+            }
+        # Keep each low-cohesion component whole after its required re-partition.
+        return {node: 0 for node in subgraph}
+
+    monkeypatch.setattr(cluster_module, "_partition", partition)
+
+    communities = cluster_module.cluster(G)
+
+    full_graph_work = G.number_of_nodes() + G.number_of_edges()
+    partition_work = sum(nodes + edges for nodes, edges in partition_inputs)
+    assert partition_inputs == [(200, 196), (200, 196), *[(50, 49)] * 4]
+    assert partition_work <= 3 * full_graph_work
+    assert partition_work == 3 * full_graph_work
+    assert {node for nodes in communities.values() for node in nodes} == set(G)
+
+
 def test_cohesion_score_complete_graph():
     G = nx.complete_graph(4)
     G = nx.relabel_nodes(G, {i: str(i) for i in G.nodes})
