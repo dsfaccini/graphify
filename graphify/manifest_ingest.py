@@ -276,7 +276,8 @@ def _parse_pom(text: str) -> dict | None:
         raise ValueError("refusing XML with DOCTYPE/ENTITY declaration")
     # Drop the default namespace so findtext/findall don't need the {uri} prefix.
     text = re.sub(r'\sxmlns="[^"]*"', '', text, count=1)
-    root = ET.fromstring(text)
+    # The pre-parse screen above rejects DTD and entity declarations.
+    root = ET.fromstring(text)  # nosec B314
     aid = root.findtext("artifactId")
     gid = root.findtext("groupId")
     if not aid:

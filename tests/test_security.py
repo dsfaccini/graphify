@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from graphify.extract import extract_csproj, extract_lazarus_package, extract_slnx, extract_xaml
 from graphify.security import (
     check_graph_file_size_cap,
     sanitize_label,
@@ -26,6 +27,26 @@ from graphify.security import (
     _sanitize_metadata_string,
     _sanitize_metadata_value,
 )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "extractor"),
+    [
+        (".lpk", extract_lazarus_package),
+        (".slnx", extract_slnx),
+        (".csproj", extract_csproj),
+        (".xaml", extract_xaml),
+    ],
+)
+def test_project_xml_extractors_reject_entity_declarations(tmp_path, suffix, extractor):
+    path = tmp_path / f"malicious{suffix}"
+    path.write_bytes(
+        b'<!DOCTYPE project [<!ENTITY expansion "untrusted">]>\n'
+        b"<project>&expansion;</project>\n"
+    )
+    result = extractor(path)
+    assert result["nodes"] == [] and result["edges"] == []
+    assert result["error"] == "refusing XML with DOCTYPE/ENTITY declaration"
 
 
 # ---------------------------------------------------------------------------

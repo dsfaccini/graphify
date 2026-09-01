@@ -82,7 +82,7 @@ jobs:
           uv run --frozen graphify install
 
   security-scan:
-    # Bandit remains advisory until its existing findings are remediated.
+    # Bandit blocks medium/high findings; low findings remain advisory via -ll.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -96,7 +96,6 @@ jobs:
         run: uv sync --frozen
 
       - name: bandit (static security analysis)
-        continue-on-error: true
         run: uv run --frozen bandit -r graphify -ll
 
       - name: pip-audit (all locked dependencies)

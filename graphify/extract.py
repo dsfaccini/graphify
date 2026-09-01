@@ -4425,7 +4425,8 @@ def extract_lazarus_package(path: Path) -> dict:
                 "error": "refusing XML with DOCTYPE/ENTITY declaration"}
 
     try:
-        xml_root = ET.fromstring(src)
+        # _project_xml_is_safe above rejects DTD and entity declarations.
+        xml_root = ET.fromstring(src)  # nosec B314
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -4532,7 +4533,8 @@ def extract_slnx(path: Path) -> dict:
                 "error": "refusing XML with DOCTYPE/ENTITY declaration"}
 
     try:
-        tree = ET.fromstring(src)
+        # _project_xml_is_safe above rejects DTD and entity declarations.
+        tree = ET.fromstring(src)  # nosec B314
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
 
@@ -4611,7 +4613,8 @@ def extract_csproj(path: Path) -> dict:
                 "error": "refusing XML with DOCTYPE/ENTITY declaration"}
 
     try:
-        tree = ET.fromstring(src)
+        # _project_xml_is_safe above rejects DTD and entity declarations.
+        tree = ET.fromstring(src)  # nosec B314
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
 
@@ -5122,7 +5125,8 @@ def extract_xaml(path: Path) -> dict:
                 "error": "refusing XML with DOCTYPE/ENTITY declaration"}
 
     try:
-        tree = ET.fromstring(src)
+        # _project_xml_is_safe above rejects DTD and entity declarations.
+        tree = ET.fromstring(src)  # nosec B314
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
 
