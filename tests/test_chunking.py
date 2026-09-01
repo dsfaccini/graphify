@@ -426,6 +426,45 @@ def test_omitted_documents_are_reconciled_and_warned(tmp_path, capsys):
     assert "produced no nodes" in err and "doc1.md" in err
 
 
+def test_covered_file_resolution_is_linear(tmp_path, monkeypatch):
+    """A fully covered corpus has a linear number of path resolutions."""
+    from graphify.llm import extract_corpus_parallel
+
+    files = []
+    for i in range(12):
+        path = tmp_path / f"doc{i}.py"
+        path.write_text("pass\n", encoding="utf-8")
+        files.append(path)
+
+    def cover_every_file(chunk, **kwargs):
+        return {
+            "nodes": [
+                {"id": path.stem, "source_file": path.name, "file_type": "code"}
+                for path in chunk
+            ],
+            "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1,
+        }
+
+    resolve = Path.resolve
+    resolve_calls = 0
+
+    def count_resolves(path, *args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setenv("GRAPHIFY_NO_INCREMENTAL_CACHE", "1")
+    monkeypatch.setattr(Path, "resolve", count_resolves)
+    with patch("graphify.llm.extract_files_direct", side_effect=cover_every_file):
+        result = extract_corpus_parallel(
+            files, backend="kimi", root=tmp_path,
+            token_budget=None, chunk_size=len(files), max_concurrency=1,
+        )
+
+    assert result["uncovered_files"] == []
+    assert resolve_calls < len(files) * 6, "covered paths were resolved per dispatched file"
+
+
 def test_out_of_scope_nodes_are_dropped_from_merged_result(tmp_path, capsys):
     """#1895: the #1757 cache guard skips the CACHE write for a node attributed
     to a real corpus file that was not dispatched, but the node itself still

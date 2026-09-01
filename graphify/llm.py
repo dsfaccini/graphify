@@ -2798,9 +2798,10 @@ def extract_corpus_parallel(
         if sf:
             p = Path(sf)
             covered.add(p if p.is_absolute() else (root / p))
+    covered_resolved = {c.resolve() for c in covered}
     uncovered = sorted(
         p for p in dispatched
-        if p.resolve() not in {c.resolve() for c in covered}
+        if p.resolve() not in covered_resolved
     )
     merged["uncovered_files"] = [str(p) for p in uncovered]
     if uncovered:
