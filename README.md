@@ -353,9 +353,13 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 | PDFs | `.pdf` |
 | Images | `.png .jpg .webp .gif` |
 | Video / Audio | `.mp4 .mov .mp3 .wav` and more (requires `uv tool install graphifyy[video]`) |
-| YouTube / URLs | any video URL (requires `uv tool install graphifyy[video]`) |
+| YouTube / URLs | Download media locally before transcription; direct URL downloads are disabled by default (requires `uv tool install graphifyy[video]`) |
 
 Code is extracted **locally with no API calls** (AST via tree-sitter). Everything else goes through your AI assistant's model API.
+
+Remote URL downloads stay disabled unless a trusted operator sets `GRAPHIFY_ALLOW_UNSANDBOXED_URL_DOWNLOADS=1`. yt-dlp is not an SSRF sandbox, so download media locally instead when a URL may be untrusted. The explicit opt-in uses a 1 GiB default download ceiling; set `GRAPHIFY_YTDLP_MAX_FILESIZE` to a positive byte count to change it.
+
+On filesystems without hard-link support, graphify exclusively creates the final name and copies the bounded download. Graphify cache readers honour a temporary publication marker, but unrelated concurrent processes can still observe an incomplete file before that copy completes.
 
 Google Drive for desktop `.gdoc`, `.gsheet`, and `.gslides` files are shortcut
 pointers, not document content. To include native Google Docs, Sheets, and Slides
@@ -564,7 +568,7 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 ## Privacy
 
 - **Code files** — processed locally via tree-sitter. Nothing leaves your machine. A code-only corpus requires no API key — `graphify extract` runs fully offline. On a mixed repo, add `--code-only` to index just the code and skip the docs/PDFs/images that would otherwise need an LLM.
-- **Video / audio** — transcribed locally with faster-whisper. Nothing leaves your machine.
+- **Video / audio** — local files are transcribed locally with faster-whisper. Nothing leaves your machine. Direct URL downloads are disabled by default because yt-dlp is not an SSRF sandbox; download media locally before transcription.
 - **Docs, PDFs, images** — sent to your AI assistant for semantic extraction (via the `/graphify` skill, using whatever model your IDE session runs). Headless `graphify extract` requires `GEMINI_API_KEY` / `GOOGLE_API_KEY` (Gemini), `MOONSHOT_API_KEY` (Kimi), `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (OpenAI), `DEEPSEEK_API_KEY` (DeepSeek), a running Ollama instance (`OLLAMA_BASE_URL`), AWS credentials via the standard provider chain (Bedrock - no API key needed, uses IAM), or the `claude` CLI binary (Claude Code - no API key needed, uses your Claude subscription). The `--dedup-llm` flag uses the same key.
 - **Data residency** — `graphify extract` auto-detects which provider to use based on which API key is set (priority: Gemini → Kimi → Claude → OpenAI → DeepSeek → Azure → Bedrock → Ollama). For code with data-residency requirements, use `--backend ollama` (fully local) or pass an explicit `--backend` flag. Kimi (`MOONSHOT_API_KEY`) routes to Moonshot AI servers in China.
 - **No telemetry**, no usage tracking, no analytics.

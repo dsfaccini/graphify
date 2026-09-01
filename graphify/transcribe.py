@@ -2,7 +2,11 @@
 # Converts video/audio files to text transcripts for graph extraction
 from __future__ import annotations
 
+import errno
+import hashlib
 import os
+import stat
+import tempfile
 from pathlib import Path
 
 from graphify.paths import out_path as _out_path
@@ -14,6 +18,17 @@ URL_PREFIXES = ('http://', 'https://', 'www.')
 _DEFAULT_MODEL = "base"
 _TRANSCRIPTS_DIR = str(_out_path("transcripts"))
 _FALLBACK_PROMPT = "Use proper punctuation and paragraph breaks."
+_ALLOW_UNSANDBOXED_URL_DOWNLOADS = "GRAPHIFY_ALLOW_UNSANDBOXED_URL_DOWNLOADS"
+_YTDLP_MAX_FILESIZE = "GRAPHIFY_YTDLP_MAX_FILESIZE"
+_DEFAULT_YTDLP_MAX_BYTES = 1024 * 1024 * 1024
+_YTDLP_BUFFER_BYTES = 64 * 1024
+_YTDLP_SOCKET_TIMEOUT_SECONDS = 30
+_AUDIO_EXTENSIONS = tuple(sorted(VIDEO_EXTENSIONS | {'.opus', '.aac', '.flac'}))
+_UNSUPPORTED_LINK_ERRNOS = frozenset({errno.EOPNOTSUPP, errno.ENOSYS, errno.EPERM, errno.EXDEV})
+
+
+class _DownloadSizeLimitExceeded(OSError):
+    """Raised when yt-dlp reports a cumulative download larger than the budget."""
 
 
 def _model_name() -> str:
@@ -42,6 +57,197 @@ def _get_yt_dlp():
         ) from exc
 
 
+def _ytdlp_max_filesize() -> int:
+    """Return the configured positive byte ceiling for an opted-in yt-dlp download."""
+    raw = os.environ.get(_YTDLP_MAX_FILESIZE)
+    if raw is None or not raw.strip():
+        return _DEFAULT_YTDLP_MAX_BYTES
+
+    value = raw.strip()
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ValueError(
+            f"{_YTDLP_MAX_FILESIZE} must be a positive byte count, got {raw!r}."
+        )
+    return int(value)
+
+
+def _require_url_download_capability() -> None:
+    """Reject remote downloads unless the operator explicitly enables the capability."""
+    if os.environ.get(_ALLOW_UNSANDBOXED_URL_DOWNLOADS) == "1":
+        return
+    raise PermissionError(
+        "URL downloads are disabled because yt-dlp is not an SSRF sandbox. "
+        "Download the media locally and transcribe the local file instead. "
+        f"Only enable {_ALLOW_UNSANDBOXED_URL_DOWNLOADS}=1 in a trusted environment."
+    )
+
+
+def _download_progress_limit(max_bytes: int):
+    """Return a yt-dlp hook that aborts a stream exceeding its cumulative budget."""
+    def enforce(status: dict[str, object]) -> None:
+        downloaded = status.get("downloaded_bytes")
+        if isinstance(downloaded, int) and downloaded > max_bytes:
+            raise _DownloadSizeLimitExceeded(
+                f"yt-dlp reported {downloaded} bytes, exceeding the {max_bytes}-byte download limit."
+            )
+
+    return enforce
+
+
+def _is_safe_audio_file(path: Path, max_bytes: int) -> bool:
+    """Return whether *path* is a regular, non-symlink audio file within the budget."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes
+
+
+def _path_exists(path: Path) -> bool:
+    """Return whether *path* exists, including a dangling symlink."""
+    return path.exists() or path.is_symlink()
+
+
+def _cached_audio_path(output_dir: Path, url_hash: str, max_bytes: int) -> Path | None:
+    """Return a safe cached audio file or reject an unsafe cache entry."""
+    for extension in _AUDIO_EXTENSIONS:
+        candidate = output_dir / f"yt_{url_hash}{extension}"
+        if _path_exists(_publishing_marker(candidate)):
+            raise OSError(f"Audio publication is still in progress: {candidate}")
+        if not _path_exists(candidate):
+            continue
+        if not _is_safe_audio_file(candidate, max_bytes):
+            raise OSError(f"Refusing unsafe cached audio file: {candidate}")
+        if _path_exists(_publishing_marker(candidate)):
+            raise OSError(f"Audio publication is still in progress: {candidate}")
+        return candidate
+    return None
+
+
+def _staged_audio_path(staging_dir: Path, url_hash: str, max_bytes: int) -> Path:
+    """Return the one bounded regular file produced in the request staging directory."""
+    candidates = sorted(staging_dir.glob(f"yt_{url_hash}.*"))
+    if len(candidates) != 1:
+        raise OSError(
+            f"Expected one downloaded audio file in {staging_dir}, found {len(candidates)}."
+        )
+    candidate = candidates[0]
+    if candidate.suffix not in _AUDIO_EXTENSIONS:
+        raise OSError(f"Refusing unexpected downloaded file: {candidate}")
+    if not _is_safe_audio_file(candidate, max_bytes):
+        raise OSError(f"Refusing unsafe downloaded audio file: {candidate}")
+    return candidate
+
+
+def _remove_owned_file(path: Path, device: int, inode: int) -> None:
+    """Remove *path* only when it still names the file created by this call."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return
+    if metadata.st_dev != device or metadata.st_ino != inode:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        return
+
+
+def _publishing_marker(destination: Path) -> Path:
+    """Return the marker that keeps Graphify cache readers off a fallback copy."""
+    return destination.with_name(f".{destination.name}.partial")
+
+
+def _exclusive_file(path: Path) -> tuple[int, int]:
+    """Create *path* without replacement and return its device and inode."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _copy_staged_audio_exclusively(staged: Path, destination: Path, max_bytes: int) -> tuple[int, int]:
+    """Copy *staged* to a newly created destination in bounded chunks."""
+    descriptor: int | None = None
+    device: int | None = None
+    inode: int | None = None
+    copied = 0
+    try:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        metadata = os.fstat(descriptor)
+        device, inode = metadata.st_dev, metadata.st_ino
+        with staged.open("rb") as source, os.fdopen(descriptor, "wb") as published:
+            descriptor = None
+            while chunk := source.read(_YTDLP_BUFFER_BYTES):
+                copied += len(chunk)
+                if copied > max_bytes:
+                    raise OSError(
+                        f"Copied {copied} bytes, exceeding the {max_bytes}-byte download limit."
+                    )
+                published.write(chunk)
+    except BaseException:
+        if device is not None and inode is not None:
+            _remove_owned_file(destination, device, inode)
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if device is None or inode is None:
+        raise OSError(f"Unable to publish audio file: {destination}")
+    return device, inode
+
+
+def _publish_with_copy_fallback(staged: Path, destination: Path, max_bytes: int) -> Path:
+    """Publish without hard links while keeping Graphify cache readers off the partial copy.
+
+    The marker is a portable coordination signal for Graphify processes. Other processes
+    can still observe the exclusive destination before the copy completes.
+    """
+    marker = _publishing_marker(destination)
+    try:
+        marker_device, marker_inode = _exclusive_file(marker)
+    except FileExistsError as exc:
+        raise OSError(f"Audio publication is already in progress: {destination}") from exc
+
+    try:
+        device, inode = _copy_staged_audio_exclusively(staged, destination, max_bytes)
+        if not _is_safe_audio_file(destination, max_bytes):
+            _remove_owned_file(destination, device, inode)
+            raise OSError(f"Refusing unsafe published audio file: {destination}")
+    finally:
+        _remove_owned_file(marker, marker_device, marker_inode)
+
+    staged.unlink()
+    return destination
+
+
+def _publish_staged_audio(staged: Path, destination: Path, max_bytes: int) -> Path:
+    """Publish *staged* without replacing an existing destination."""
+    if _path_exists(destination):
+        raise OSError(f"Refusing to replace existing audio file: {destination}")
+
+    metadata = staged.lstat()
+    try:
+        os.link(staged, destination, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise OSError(f"Refusing to replace existing audio file: {destination}") from exc
+    except NotImplementedError:
+        return _publish_with_copy_fallback(staged, destination, max_bytes)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_LINK_ERRNOS:
+            return _publish_with_copy_fallback(staged, destination, max_bytes)
+        raise
+
+    if not _is_safe_audio_file(destination, max_bytes):
+        _remove_owned_file(destination, metadata.st_dev, metadata.st_ino)
+        raise OSError(f"Refusing unsafe published audio file: {destination}")
+
+    staged.unlink()
+    return destination
+
+
 def is_url(path: str) -> bool:
     """Return True if the string looks like a URL rather than a file path."""
     return any(path.startswith(p) for p in URL_PREFIXES)
@@ -50,46 +256,55 @@ def is_url(path: str) -> bool:
 def download_audio(url: str, output_dir: Path) -> Path:
     """Download audio-only stream from a URL using yt-dlp.
 
-    Returns the path to the downloaded audio file (.m4a or .opus).
-    Uses cached file if already downloaded.
+    Returns the path to the downloaded media file.
+    URL downloads require an explicit trusted-environment capability.
     """
+    _require_url_download_capability()
+
     from graphify.security import validate_url
+
     validate_url(url)  # blocks private IPs, bad schemes before yt-dlp runs
-    yt_dlp = _get_yt_dlp()
+    max_bytes = _ytdlp_max_filesize()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # yt-dlp uses %(title)s which can be long/weird — use a stable name based on URL hash
-    import hashlib
     url_hash = hashlib.sha1(url.encode(), usedforsecurity=False).hexdigest()[:12]
-    out_template = str(output_dir / f"yt_{url_hash}.%(ext)s")
 
-    # Check for already-downloaded file
-    for ext in ('.m4a', '.opus', '.mp3', '.ogg', '.wav', '.webm'):
-        candidate = output_dir / f"yt_{url_hash}{ext}"
-        if candidate.exists():
-            print(f"  cached audio: {candidate.name}")
-            return candidate
+    cached = _cached_audio_path(output_dir, url_hash, max_bytes)
+    if cached is not None:
+        print(f"  cached audio: {cached.name}")
+        return cached
 
+    yt_dlp = _get_yt_dlp()
     ydl_opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'outtmpl': out_template,
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
+        'max_filesize': max_bytes,
+        'buffersize': _YTDLP_BUFFER_BYTES,
+        'noresizebuffer': True,
+        'continuedl': False,
+        'retries': 0,
+        'fragment_retries': 0,
+        'extractor_retries': 0,
+        'file_access_retries': 0,
+        'socket_timeout': _YTDLP_SOCKET_TIMEOUT_SECONDS,
+        'skip_unavailable_fragments': False,
+        'progress_hooks': [_download_progress_limit(max_bytes)],
         'postprocessors': [],  # no ffmpeg needed — use native audio
     }
 
     print(f"  downloading audio: {url[:80]} ...", flush=True)
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        ext = info.get('ext', 'm4a')
-        downloaded = output_dir / f"yt_{url_hash}.{ext}"
-        if not downloaded.exists():
-            # yt-dlp may have picked a different extension
-            for p in output_dir.glob(f"yt_{url_hash}.*"):
-                downloaded = p
-                break
-        return downloaded
+    with tempfile.TemporaryDirectory(prefix=f".yt_{url_hash}-", dir=output_dir) as staging:
+        staging_dir = Path(staging)
+        ydl_opts['outtmpl'] = str(staging_dir / f"yt_{url_hash}.%(ext)s")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        staged = _staged_audio_path(staging_dir, url_hash, max_bytes)
+        destination = output_dir / staged.name
+        return _publish_staged_audio(staged, destination, max_bytes)
 
 
 def build_whisper_prompt(god_nodes: list[dict]) -> str:
