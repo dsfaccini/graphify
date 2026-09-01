@@ -1,6 +1,7 @@
 # monitor a folder and auto-trigger --update when files change
 from __future__ import annotations
 import contextlib
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -17,6 +18,72 @@ from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT, is_absolute_any_platfo
 logger = logging.getLogger(__name__)
 _PENDING_FILENAME = ".pending_changes"
 _PENDING_DRAIN_MAX_PASSES = 20
+
+
+@dataclass(frozen=True)
+class _ExistingGraphSnapshot:
+    """One validated graph.json view, plus its on-disk identity at read time."""
+
+    data: dict
+    token: tuple[int, int, int, int]
+
+
+def _graph_file_token(path: Path) -> tuple[int, int, int, int] | None:
+    """Return a replacement-sensitive stat token, or None when the path is gone."""
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+
+
+def _load_existing_graph_snapshot(path: Path) -> _ExistingGraphSnapshot | None:
+    """Read one bounded, stable graph.json mapping for a watch rebuild.
+
+    A rebuild needs the raw graph for semantic-document detection, resolver
+    context, reconciliation, and write comparisons. Keeping one validated view
+    avoids repeatedly decoding the same full snapshot. A changed stat token
+    means the source was unstable while being read, so callers fail closed
+    rather than mixing two graph versions.
+    """
+    before = _graph_file_token(path)
+    if before is None:
+        return None
+    from graphify.security import check_graph_file_size_cap
+    check_graph_file_size_cap(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot read {path} for incremental rebuild: {exc}. "
+            "Delete the file and run a full rebuild."
+        ) from exc
+    after = _graph_file_token(path)
+    if after != before:
+        raise RuntimeError(
+            f"Cannot read {path} for incremental rebuild: graph changed while reading. "
+            "Retry the rebuild."
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Cannot read {path} for incremental rebuild: {exc}. "
+            "Delete the file and run a full rebuild."
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Cannot read {path} for incremental rebuild: expected a JSON object. "
+            "Delete the file and run a full rebuild."
+        )
+    return _ExistingGraphSnapshot(data=data, token=after)
+
+
+def _snapshot_is_current(path: Path, snapshot: _ExistingGraphSnapshot | None) -> bool:
+    """Whether a write can safely replace the graph version this rebuild read."""
+    if snapshot is None:
+        return _graph_file_token(path) is None
+    return _graph_file_token(path) == snapshot.token
 
 
 def _queue_pending(out_dir: Path, changed_paths: list[Path]) -> None:
@@ -547,7 +614,7 @@ def _reconcile_markdown_links(
         semantic_documents = [
             node
             for node in nodes
-            if node.get("file_type") == "document" and node.get("_origin") != "ast"
+            if node.get("file_type") == "document" and not _is_ast_tier(node)
         ]
         if len(canonical) == 1:
             representatives[source_file] = canonical[0]["id"]
@@ -718,6 +785,7 @@ def _reconcile_existing_graph(
     existing_graph: Path,
     result: dict,
     *,
+    existing_graph_data: dict | None = None,
     out: Path,
     project_root: Path,
     watch_root: Path,
@@ -740,37 +808,24 @@ def _reconcile_existing_graph(
     ``graphify update``) so the incremental/hook path keeps preserving a
     deliberately-graphed .gitignore'd tree (#1795).
     """
-    existing_graph_data: dict = {}
-    if not existing_graph.exists():
-        return result, existing_graph_data
+    if existing_graph_data is None:
+        # Direct callers retain the same fail-closed load contract as a rebuild.
+        # _rebuild_code passes its already-validated snapshot so the same graph
+        # is not decoded again during reconciliation.
+        snapshot = _load_existing_graph_snapshot(existing_graph)
+        if snapshot is None:
+            return result, {}
+        existing = snapshot.data
+    else:
+        existing = existing_graph_data
 
-    # Fail-closed load (#2251): reuse build._load_existing_graph, which raises
-    # ValueError when the file exceeds the size cap and RuntimeError when it
-    # exists but cannot be parsed. Those failures must PROPAGATE to the caller
-    # — swallowing them here left existing_graph_data == {}, which _check_shrink
-    # reads as "no baseline, write allowed", so the hook overwrote a graph it
-    # merely failed to READ. A missing file (None) keeps first-build behavior:
-    # reconcile proceeds with an empty baseline and the write is allowed.
-    from graphify.build import _load_existing_graph
-    if _load_existing_graph(existing_graph) is None:
-        return result, existing_graph_data
-    # Cap + parse validated above. Reload as the full dict — reconcile needs
-    # top-level keys (hyperedges, per-node community for _node_community_map,
-    # topology compare) the (nodes, edges, hyperedges) tuple does not carry.
-    # A failure here (e.g. a race rewriting the file) still propagates,
-    # staying fail-closed.
-    existing = json.loads(existing_graph.read_text(encoding="utf-8"))
-    existing_graph_data = existing
-
-    # Backfill tier provenance on legacy items (#2334), mirroring
-    # build._load_existing_graph (this reconcile path loads the raw dict
-    # separately, so the backfill there does not reach it). Stamping preserved
-    # items means the graph self-heals on this write.
     from graphify.build import _is_ast_tier
-    for _bucket in ("nodes", "links", "edges"):
-        for _item in existing.get(_bucket, []):
-            if isinstance(_item, dict):
-                _item.setdefault("_origin", "ast" if _is_ast_tier(_item) else "semantic")
+
+    def _preserved_record(item: dict) -> dict:
+        """Copy a carried-forward record before healing its tier marker."""
+        copied = item.copy()
+        copied.setdefault("_origin", "ast" if _is_ast_tier(copied) else "semantic")
+        return copied
 
     try:
         from graphify.build import _norm_source_file as _nsf
@@ -917,7 +972,7 @@ def _reconcile_existing_graph(
         # Incremental extraction owns only nodes from rebuilt or deleted
         # sources. Semantic-tier nodes (per _is_ast_tier) remain preserved.
         preserved_nodes = [
-            node
+            _preserved_record(node)
             for node in existing.get("nodes", [])
             if node["id"] not in new_ast_ids
             and not (
@@ -944,7 +999,7 @@ def _reconcile_existing_graph(
         # the node reconciliation above applies via _origin (#1865). Deletion
         # eviction stays provenance-blind.
         preserved_edges = [
-            edge
+            _preserved_record(edge)
             for edge in existing.get("links", existing.get("edges", []))
             if edge.get("source") in all_ids
             and edge.get("target") in all_ids
@@ -978,7 +1033,7 @@ def _reconcile_existing_graph(
                 continue
             if isinstance(members, list) and any(member not in all_ids for member in members):
                 continue
-            preserved_hyperedges.append(edge)
+            preserved_hyperedges.append(edge.copy() if isinstance(edge, dict) else edge)
 
         for item in preserved_nodes + preserved_edges + preserved_hyperedges:
             source_paths.rebase_preserved(item)
@@ -989,7 +1044,7 @@ def _reconcile_existing_graph(
             "hyperedges": result.get("hyperedges", []) + preserved_hyperedges,
             "input_tokens": 0,
             "output_tokens": 0,
-        }, existing_graph_data
+        }, existing
     except Exception as exc:
         # Post-load reconciliation failure: fall back to the fresh extraction
         # while keeping the loaded baseline, so _check_shrink still guards the
@@ -1000,7 +1055,7 @@ def _reconcile_existing_graph(
             "extraction only.",
             file=sys.stderr,
         )
-        return result, existing_graph_data
+        return result, existing
 
 
 def _node_community_map(graph_data: dict) -> dict[str, int]:
@@ -1405,7 +1460,6 @@ def _rebuild_code(
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
         from graphify.export import to_json
-        from graphify.security import check_graph_file_size_cap
 
         # Re-apply the excludes the initial extract recorded, so an update/watch/
         # hook rebuild does not silently re-include deliberately excluded paths
@@ -1445,6 +1499,32 @@ def _rebuild_code(
                 ast_doc_files.append(p)
 
         existing_graph = out / "graph.json"
+
+        # A valid graph is needed by several independent phases below. Soft
+        # consumers retain their historical fallback on an unreadable graph;
+        # reconciliation later asks for it strictly and refuses to overwrite.
+        existing_snapshot: _ExistingGraphSnapshot | None = None
+        snapshot_failure: RuntimeError | ValueError | None = None
+
+        def _existing_snapshot(*, required: bool) -> _ExistingGraphSnapshot | None:
+            nonlocal existing_snapshot, snapshot_failure
+            if existing_snapshot is not None:
+                return existing_snapshot
+            if snapshot_failure is not None:
+                if required:
+                    raise snapshot_failure
+                return None
+            try:
+                snapshot = _load_existing_graph_snapshot(existing_graph)
+            except (RuntimeError, ValueError) as exc:
+                snapshot_failure = exc
+                if required:
+                    raise
+                return None
+            if snapshot is not None:
+                existing_snapshot = snapshot
+            return snapshot
+
         if not code_files and not existing_graph.exists():
             print("[graphify watch] No code files found - nothing to rebuild.")
             return False
@@ -1466,8 +1546,10 @@ def _rebuild_code(
         semantic_doc_files: set[Path] = set()
         if ast_doc_files and existing_graph.exists():
             try:
-                check_graph_file_size_cap(existing_graph)
-                prior = json.loads(existing_graph.read_text(encoding="utf-8"))
+                snapshot = _existing_snapshot(required=False)
+                if snapshot is None:
+                    raise RuntimeError("existing graph is unavailable")
+                prior = snapshot.data
                 prior_paths = _StoredSourcePaths(
                     prior,
                     out=out,
@@ -1609,8 +1691,10 @@ def _rebuild_code(
         resolution_context_edges: list[dict] = []
         if changed_paths is not None and existing_graph.exists():
             try:
-                check_graph_file_size_cap(existing_graph)
-                ctx_graph = json.loads(existing_graph.read_text(encoding="utf-8"))
+                snapshot = _existing_snapshot(required=False)
+                if snapshot is None:
+                    raise RuntimeError("existing graph is unavailable")
+                ctx_graph = snapshot.data
                 ctx_paths = _StoredSourcePaths(
                     ctx_graph,
                     out=out,
@@ -1726,9 +1810,11 @@ def _rebuild_code(
         # source_file matches a path that was changed (re-extracted) or deleted —
         # otherwise the old nodes for those files would survive forever.
         try:
+            snapshot = _existing_snapshot(required=True)
             result, existing_graph_data = _reconcile_existing_graph(
                 existing_graph,
                 result,
+                existing_graph_data=snapshot.data if snapshot is not None else None,
                 out=out,
                 project_root=project_root,
                 watch_root=watch_root,
@@ -1787,25 +1873,10 @@ def _rebuild_code(
             }
             candidate_graph_text = _json_text(candidate_graph_data)
             same_graph = False
-            if existing_graph.exists():
-                try:
-                    check_graph_file_size_cap(existing_graph)
-                    existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
-                except Exception as exc:
-                    # A load failure is NOT "graph changed" (#2251): refuse to
-                    # overwrite a graph we merely failed to read. Normally
-                    # unreachable — the reconcile load above already failed
-                    # closed — but a race rewriting the file can land here.
-                    print(
-                        f"error: Cannot read {existing_graph}: {exc}. "
-                        "Refusing to overwrite; delete the file and run a "
-                        "full rebuild.",
-                        file=sys.stderr,
-                    )
-                    return False
+            if existing_snapshot is not None:
                 try:
                     same_graph = (
-                        json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
+                        json.dumps(_canonical_graph_for_compare(existing_snapshot.data), sort_keys=True, ensure_ascii=False)
                         == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
                     )
                 except Exception:
@@ -1817,6 +1888,13 @@ def _rebuild_code(
                     rebuilt_sources=rebuilt_sources,
                     failed_sources=failed_sources,
                 ):
+                    return False
+                if not _snapshot_is_current(existing_graph, existing_snapshot):
+                    print(
+                        f"error: {existing_graph} changed during rebuild. "
+                        "Refusing to overwrite; retry the rebuild.",
+                        file=sys.stderr,
+                    )
                     return False
                 from graphify.export import backup_if_protected as _backup
                 _backup(out)
@@ -1874,10 +1952,10 @@ def _rebuild_code(
         # build_from_json defaults to directed=False otherwise.
         G = build_from_json(result, directed=bool((existing_graph_data or {}).get("directed", False)))
         candidate_topology = _topology_from_graph(G)
-        if existing_graph_data:
+        if existing_snapshot is not None:
             try:
                 same_topology = (
-                    json.dumps(_canonical_topology_for_compare(existing_graph_data), sort_keys=True, ensure_ascii=False)
+                    json.dumps(_canonical_topology_for_compare(existing_snapshot.data), sort_keys=True, ensure_ascii=False)
                     == json.dumps(_canonical_topology_for_compare(candidate_topology), sort_keys=True, ensure_ascii=False)
                 )
             except Exception:
@@ -1991,26 +2069,10 @@ def _rebuild_code(
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
         same_graph = False
         same_report = False
-        if existing_graph.exists():
-            try:
-                check_graph_file_size_cap(existing_graph)
-                existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
-            except Exception as exc:
-                # A load failure is NOT "graph changed" (#2251): refuse to
-                # overwrite a graph we merely failed to read. Normally
-                # unreachable — the reconcile load above already failed
-                # closed — but a race rewriting the file can land here.
-                graph_tmp.unlink(missing_ok=True)
-                print(
-                    f"error: Cannot read {existing_graph}: {exc}. "
-                    "Refusing to overwrite; delete the file and run a "
-                    "full rebuild.",
-                    file=sys.stderr,
-                )
-                return False
+        if existing_snapshot is not None:
             try:
                 same_graph = (
-                    json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
+                    json.dumps(_canonical_graph_for_compare(existing_snapshot.data), sort_keys=True, ensure_ascii=False)
                     == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
                 )
             except Exception:
@@ -2030,6 +2092,14 @@ def _rebuild_code(
                 rebuilt_sources=rebuilt_sources,
                 failed_sources=failed_sources,
             ):
+                return False
+            if not _snapshot_is_current(existing_graph, existing_snapshot):
+                graph_tmp.unlink(missing_ok=True)
+                print(
+                    f"error: {existing_graph} changed during rebuild. "
+                    "Refusing to overwrite; retry the rebuild.",
+                    file=sys.stderr,
+                )
                 return False
             from graphify.exporters.html import _HTML_STALE_MARKER
             # Mark before graph.json advances so an interruption cannot leave a

@@ -2949,6 +2949,38 @@ def test_rebuild_refuses_overwrite_when_existing_graph_corrupt(
     assert "error:" in capsys.readouterr().err
 
 
+def test_rebuild_caches_unreadable_snapshot_after_soft_access(tmp_path, monkeypatch, capsys):
+    """Soft document/context consumers share one corrupt-graph load failure."""
+    import graphify.watch as watch_mod
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    app = corpus / "app.py"
+    app.write_text("def app():\n    return 1\n", encoding="utf-8")
+    # An AST document triggers semantic-document inspection before changed-path
+    # resolver context and required reconciliation reach the shared failure.
+    (corpus / "guide.md").write_text("# Guide\n\nDetails.\n", encoding="utf-8")
+    assert watch_mod._rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    graph_path = corpus / "graphify-out" / "graph.json"
+    truncated = graph_path.read_text(encoding="utf-8")[:40]
+    graph_path.write_text(truncated, encoding="utf-8")
+    loads: list[Path] = []
+    real_load = watch_mod._load_existing_graph_snapshot
+
+    def count_load(path: Path):
+        loads.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(watch_mod, "_load_existing_graph_snapshot", count_load)
+    assert watch_mod._rebuild_code(
+        corpus, changed_paths=[app], no_cluster=True, acquire_lock=False,
+    ) is False
+    assert loads == [graph_path]
+    assert graph_path.read_text(encoding="utf-8") == truncated
+    assert "error:" in capsys.readouterr().err
+
+
 def test_rebuild_force_does_not_clobber_unreadable_graph(tmp_path, capsys):
     """#2251: --force means \"accept a shrink\", not \"overwrite a graph that
     could not be read\"."""
@@ -2988,6 +3020,93 @@ def test_rebuild_readable_graph_still_preserves_semantic_nodes(tmp_path):
         e.get("source") == "notes_concept" and e.get("target") == "notes_doc"
         for e in after["links"]
     ), "semantic link must survive an incremental rebuild"
+
+
+@pytest.mark.parametrize("no_cluster", [True, False], ids=["no-cluster", "clustered"])
+def test_incremental_rebuild_reuses_snapshot_and_restamps_legacy_metadata(
+    tmp_path, monkeypatch, no_cluster
+):
+    """One immutable snapshot feeds every phase and exposes legacy markers to write."""
+    import graphify.watch as watch_mod
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    caller = corpus / "a.py"
+    caller.write_text(
+        "from b import beta\n\n\ndef alpha():\n    return beta()\n",
+        encoding="utf-8",
+    )
+    (corpus / "b.py").write_text("def beta():\n    return 1\n", encoding="utf-8")
+    # An AST-extractable document activates the semantic-document inspection;
+    # the changed caller activates persisted cross-file resolver context.
+    (corpus / "guide.md").write_text("# Guide\n\nDetails.\n", encoding="utf-8")
+    assert watch_mod._rebuild_code(
+        corpus, no_cluster=no_cluster, acquire_lock=False,
+    ) is True
+
+    graph_path = corpus / "graphify-out" / "graph.json"
+    legacy = json.loads(graph_path.read_text(encoding="utf-8"))
+    for bucket in ("nodes", "links", "edges"):
+        for item in legacy.get(bucket, []):
+            item.pop("_origin", None)
+    graph_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loads: list[Path] = []
+    real_load = watch_mod._load_existing_graph_snapshot
+
+    def count_load(path: Path):
+        loads.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(watch_mod, "_load_existing_graph_snapshot", count_load)
+    caller.write_text(
+        "from b import beta\n\n\ndef alpha():\n    return beta() + 1\n",
+        encoding="utf-8",
+    )
+    assert watch_mod._rebuild_code(
+        corpus, changed_paths=[caller], no_cluster=no_cluster, acquire_lock=False,
+    ) is True
+    assert loads == [graph_path]
+    restamped = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert all(node.get("_origin") for node in restamped["nodes"])
+    assert restamped["links"]
+    assert all(link.get("_origin") for link in restamped["links"])
+
+
+def test_incremental_rebuild_refuses_graph_changed_after_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    """A graph replaced after comparison must not be overwritten by a stale rebuild."""
+    import graphify.watch as watch_mod
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    app = corpus / "app.py"
+    app.write_text("def first():\n    return 1\n", encoding="utf-8")
+    assert watch_mod._rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    graph_path = corpus / "graphify-out" / "graph.json"
+    external_graph = json.dumps({
+        "nodes": [{"id": "external", "label": "External"}],
+        "links": [],
+        "hyperedges": [],
+    })
+
+    def replace_after_check(*args, **kwargs):
+        graph_path.write_text(external_graph, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(watch_mod, "_check_shrink", replace_after_check)
+    app.write_text(
+        "def first():\n    return 1\n\n\ndef second():\n    return 2\n",
+        encoding="utf-8",
+    )
+    assert watch_mod._rebuild_code(
+        corpus, changed_paths=[app], no_cluster=True, acquire_lock=False,
+    ) is False
+    assert graph_path.read_text(encoding="utf-8") == external_graph
+    assert not (corpus / "graphify-out" / ".graph.tmp.json").exists()
+    assert "changed during rebuild" in capsys.readouterr().err
 
 
 # --- #2342: `graphify update` rebuild must inherit the on-disk directed flag ---
