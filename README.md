@@ -899,8 +899,8 @@ uv run --frozen graphify install
 
 Ruff is useful as an additional local check (`uv run --frozen ruff check .`),
 but is not currently a blocking CI job. Pyright is also local/advisory unless it
-is added to CI later. The Bandit and pip-audit CI steps currently use
-`continue-on-error`, so their findings are advisory rather than blocking.
+is added to CI later. Bandit blocks medium/high findings, and the strict
+pip-audit step blocks locked dependency audit failures.
 
 > macOS note: the test suite includes both `sample.f90` and `sample.F90` fixtures. These collide on case-insensitive HFS+ / APFS file systems. Run on Linux or in a Docker container if you need to test both Fortran variants simultaneously.
 
